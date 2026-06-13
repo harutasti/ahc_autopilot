@@ -25,12 +25,39 @@ Create a problem under `problems/<contest>/`:
 
 ```text
 problems/<contest>/
+  statement.md
+  problem_brief.md        # optional AI-oriented summary
   config.yaml
   tools/
     generator.py or official generator
     scorer.py or official tester/scorer
     visualizer...
 ```
+
+Put the contest statement in `statement.md` before running autonomous
+improvement. It can be the full statement, but an AI-friendly version is better:
+
+```md
+# AHC001
+
+## Goal
+
+## Input
+
+## Output
+
+## Constraints
+
+## Score
+
+## Validity
+
+## Notes
+```
+
+`autopilot` uses the problem config and generated run analysis today. Keep
+`statement.md` next to the config so specialist agents and future fetch/brief
+commands have a stable source of problem truth.
 
 `config.yaml` defines commands with placeholders:
 
@@ -44,6 +71,23 @@ run_command: "{solver} < {input} > {output}"
 score_command: python3 {problem_dir}/tools/scorer.py {input} {output}
 score_regex: SCORE:\s*([-+0-9.eE]+)
 ```
+
+For a real contest such as AHC001, the minimum human setup is:
+
+```bash
+python3 tools/ahc.py init-problem ahc001
+```
+
+Then:
+
+- place the problem statement at `problems/ahc001/statement.md`;
+- place official generator/tester/visualizer tools under `problems/ahc001/tools/`;
+- update `problems/ahc001/config.yaml` so the commands call those tools;
+- replace `solver/main.cpp` with a valid baseline solver.
+
+A valid baseline does not need to be strong. It only needs to compile, respect
+the output format, and pass the official tester/scorer so autopilot has a safe
+starting point.
 
 ## MCP servers
 
