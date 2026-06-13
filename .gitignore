@@ -1,0 +1,12 @@
+.ahc_lab/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+experiments/
+worktrees/
+*.out
+*.err
+*.exe
+solver/solver
+

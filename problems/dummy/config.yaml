@@ -1,0 +1,8 @@
+name: dummy
+score_direction: max
+time_limit_sec: 2
+build_command: g++ -std=c++20 -O2 -pipe -Wall -Wextra -o {build_dir}/solver solver/main.cpp
+generator_command: python3 {problem_dir}/tools/generator.py --seed {seed} > {input}
+run_command: "{solver} < {input} > {output}"
+score_command: python3 {problem_dir}/tools/scorer.py {input} {output}
+score_regex: SCORE:\s*([-+0-9.eE]+)

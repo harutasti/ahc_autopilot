@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ahc-ai-lab"
+version = "0.1.0"
+description = "Autonomous multi-agent AtCoder Heuristic Contest improvement lab"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+ahc = "ahc_lab.cli:main"
+ahc-mcp = "ahc_lab.mcp_server:main"
+
+[tool.setuptools]
+packages = ["ahc_lab"]
+

@@ -1,0 +1,4 @@
+interface:
+  display_name: "AHC AI Lab"
+  short_description: "Autonomous AtCoder Heuristic improvement lab"
+  default_prompt: "Use $ahc-ai-lab to improve an AtCoder Heuristic solver with multi-agent evaluation."
