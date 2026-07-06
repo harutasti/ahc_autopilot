@@ -13,3 +13,4 @@ solver/solver
 *.un~
 target/
 out.svg
+vis.html

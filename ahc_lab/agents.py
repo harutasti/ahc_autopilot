@@ -110,6 +110,9 @@ Focus for this run:
 
 Project rules:
 - Modify only what your role requires.
+- Never write to files outside your current working directory; it is your
+  isolated candidate workspace. Notes belong in the workspace, not the shared
+  project root.
 - Keep the C++20 solver valid for AtCoder submission.
 - Preserve reproducibility, timer safety, and output format.
 - State the hypothesis, changed files, expected score effect, and risk.
