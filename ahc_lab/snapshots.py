@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import difflib
 import hashlib
 import shutil
 from pathlib import Path
@@ -54,6 +55,43 @@ def snapshot_solver_source(root: Path, store_dir: Path) -> str | None:
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(path, target)
     return source_hash
+
+
+def diff_snapshots(
+    store_dir: Path, base_hash: str, new_hash: str, limit_chars: int = 4000
+) -> str:
+    """Unified diff between two stored source snapshots, truncated for prompts."""
+    base_dir = store_dir / base_hash
+    new_dir = store_dir / new_hash
+    if not base_dir.is_dir() or not new_dir.is_dir():
+        return ""
+    names = sorted(
+        {p.relative_to(new_dir).as_posix() for p in new_dir.rglob("*") if p.is_file()}
+        | {p.relative_to(base_dir).as_posix() for p in base_dir.rglob("*") if p.is_file()}
+    )
+    chunks: list[str] = []
+    for name in names:
+        base_file = base_dir / name
+        new_file = new_dir / name
+        base_lines = (
+            base_file.read_text(encoding="utf-8", errors="replace").splitlines(keepends=True)
+            if base_file.exists()
+            else []
+        )
+        new_lines = (
+            new_file.read_text(encoding="utf-8", errors="replace").splitlines(keepends=True)
+            if new_file.exists()
+            else []
+        )
+        diff = "".join(
+            difflib.unified_diff(base_lines, new_lines, fromfile=f"a/{name}", tofile=f"b/{name}")
+        )
+        if diff:
+            chunks.append(diff)
+    joined = "".join(chunks)
+    if len(joined) > limit_chars:
+        return joined[:limit_chars] + "\n...[diff truncated]...\n"
+    return joined
 
 
 def restore_solver_source(store_dir: Path, source_hash: str, root: Path) -> Path:

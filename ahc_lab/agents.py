@@ -15,7 +15,7 @@ from .knowledge import search_knowledge
 from .policy import AcceptancePolicy, evaluate_acceptance
 from .runner import run_shell
 from .seeds import parse_seed_spec
-from .snapshots import restore_solver_source, store_dir_for
+from .snapshots import diff_snapshots, restore_solver_source, store_dir_for
 from .workspace import create_candidate_workspace
 
 
@@ -94,6 +94,7 @@ def build_agent_prompt(
     analysis: dict[str, Any],
     knowledge_hits: list[dict[str, Any]],
     focus: str | None = None,
+    recent_changes: str = "",
 ) -> str:
     responsibility = SPECIALISTS.get(agent_name) or REVIEWERS.get(agent_name) or "Improve the solver."
     brief = make_ai_brief(ExperimentDB.default(root), run_id)
@@ -128,6 +129,9 @@ Structured analysis:
 
 Relevant knowledge:
 {knowledge_hits}
+
+Recent accepted changes (already merged into your workspace; build on them, do not undo them):
+{recent_changes or "(none yet)"}
 
 Return a concise implementation plan first. If you are connected to a writable
 workspace, implement the candidate change and leave a summary.
@@ -262,6 +266,7 @@ class Autopilot:
                 ),
                 limit=6,
             )
+            recent_changes = self._recent_accepted_diffs()
             trials: list[dict[str, Any]] = []
             for idx, agent_name in enumerate(selected[:max_trials], start=1):
                 candidate_name = f"g{generation}_candidate_{idx}_{agent_name}"
@@ -282,6 +287,7 @@ class Autopilot:
                     analysis=analysis,
                     knowledge_hits=knowledge_hits,
                     focus=focus,
+                    recent_changes=recent_changes,
                 )
                 prompt_path = prompt_dir / f"{candidate_name}.md"
                 prompt_path.write_text(prompt, encoding="utf-8")
@@ -377,6 +383,7 @@ class Autopilot:
                 analysis = analyze_run(self.db, baseline_run_id)
                 merged_count += 1
                 merged_this_generation = True
+            self._record_insights(generation, outcomes)
             if not merge_accepted:
                 break
             if not merged_this_generation:
@@ -510,6 +517,7 @@ class Autopilot:
                 run_type="validation",
                 jobs=jobs,
                 use_cache=use_cache,
+                parent_run_id=outcome.candidate_run_id,
             )
             comparison = compare_runs(self.db, baseline_val, candidate_val)
             verdict = evaluate_acceptance(comparison, policy)
@@ -521,6 +529,70 @@ class Autopilot:
             "candidate_run_id": candidate_val,
             "acceptance": verdict,
         }
+
+    def _recent_accepted_diffs(self, limit: int = 2) -> str:
+        """Unified diffs of the latest merged candidates, for prompt inspiration."""
+        sections: list[str] = []
+        for patch in self.db.list_merged_patches(limit):
+            if not patch.get("base_run_id") or not patch.get("new_run_id"):
+                continue
+            base_hash = self.db.get_run(patch["base_run_id"]).get("source_hash")
+            new_hash = self.db.get_run(patch["new_run_id"]).get("source_hash")
+            if not base_hash or not new_hash:
+                continue
+            diff = diff_snapshots(store_dir_for(self.db), base_hash, new_hash, limit_chars=2500)
+            if diff:
+                sections.append(
+                    f"### {patch['role']} ({patch['candidate_name']})\n```diff\n{diff}\n```"
+                )
+        return "\n\n".join(sections)
+
+    def _record_insights(self, generation: int, outcomes: list[TrialOutcome]) -> None:
+        """Append structured trial results to the problem knowledge notes.
+
+        These entries feed future prompts through knowledge search, so failed
+        hypotheses are not retried and accepted directions are reinforced.
+        """
+        if not outcomes:
+            return
+        knowledge_dir = self.root / "knowledge"
+        knowledge_dir.mkdir(exist_ok=True)
+        path = knowledge_dir / f"{self.problem}_autopilot.md"
+        lines: list[str] = []
+        if not path.exists():
+            lines.append(f"# {self.problem} autopilot insights\n\nAuto-generated per generation.\n")
+        stamp = time.strftime("%Y-%m-%d %H:%M")
+        for outcome in sorted(outcomes, key=lambda o: o.trial_id):
+            trial = self.db.get_trial(outcome.trial_id)
+            summary = outcome.summary or {}
+            acceptance = summary.get("acceptance") or {}
+            cascade = summary.get("cascade") or {}
+            lines.append(f"\n## {stamp} g{generation} {trial['role']} -> {trial['decision']}\n")
+            if summary.get("mean_effective_delta") is not None:
+                lines.append(
+                    f"- mean effective delta {summary['mean_effective_delta']}, "
+                    f"confidence {summary.get('improve_confidence')}, "
+                    f"wins/ties/losses {summary.get('wins')}/{summary.get('ties')}/{summary.get('losses')}\n"
+                )
+            reasons = acceptance.get("reasons") or []
+            if summary.get("error"):
+                reasons = [summary["error"], *reasons]
+            if reasons:
+                lines.append(f"- verdict: {'; '.join(str(r) for r in reasons if r)}\n")
+            if cascade.get("pruned"):
+                lines.append(f"- pruned early: {cascade.get('prune_reason')}\n")
+            agent_note = self._adapter_log_tail(outcome.trial_id)
+            if agent_note:
+                lines.append(f"- agent summary tail: {agent_note}\n")
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write("".join(lines))
+
+    def _adapter_log_tail(self, trial_id: int, limit: int = 400) -> str:
+        path = self.root / "experiments" / "adapter_logs" / f"trial_{trial_id}.stdout.txt"
+        if not path.exists():
+            return ""
+        text = path.read_text(encoding="utf-8", errors="replace").strip()
+        return " ".join(text[-limit:].split())
 
     def _merge_candidate(self, trial_id: int, candidate_name: str, candidate_run_id: int) -> str:
         """Copy an accepted candidate's source back into the mainline solver."""
@@ -542,7 +614,8 @@ class Autopilot:
     ) -> None:
         rendered = command.format(prompt=shlex.quote(str(prompt_path)), cwd=shlex.quote(str(cwd)))
         env_cmd = os.path.expandvars(rendered)
-        result = run_shell(env_cmd, cwd, timeout=600)
+        timeout = float(os.environ.get("AHC_ADAPTER_TIMEOUT_SEC", "600"))
+        result = run_shell(env_cmd, cwd, timeout=timeout)
         log_dir = self.root / "experiments" / "adapter_logs"
         log_dir.mkdir(parents=True, exist_ok=True)
         stem = f"trial_{trial_id}" if trial_id is not None else str(int(time.time()))

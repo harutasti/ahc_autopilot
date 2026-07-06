@@ -17,6 +17,7 @@ create table if not exists runs (
   solver_path text not null,
   build_command text not null,
   source_hash text,
+  parent_run_id integer,
   params_json text not null default '{}',
   status text not null default 'running',
   created_at real not null,
@@ -148,6 +149,8 @@ class ExperimentDB:
         run_columns = {row[1] for row in self.conn.execute("pragma table_info(runs)")}
         if "source_hash" not in run_columns:
             self.conn.execute("alter table runs add column source_hash text")
+        if "parent_run_id" not in run_columns:
+            self.conn.execute("alter table runs add column parent_run_id integer")
         case_columns = {row[1] for row in self.conn.execute("pragma table_info(cases)")}
         if "source_case_id" not in case_columns:
             self.conn.execute("alter table cases add column source_case_id integer")
@@ -170,13 +173,14 @@ class ExperimentDB:
         build_command: str,
         params: dict[str, Any] | None = None,
         source_hash: str | None = None,
+        parent_run_id: int | None = None,
     ) -> int:
         cur = self.conn.execute(
             """
             insert into runs
             (problem, tag, run_type, score_direction, solver_path, build_command,
-             source_hash, params_json, created_at)
-            values (?, ?, ?, ?, ?, ?, ?, ?, ?)
+             source_hash, parent_run_id, params_json, created_at)
+            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 problem,
@@ -186,6 +190,7 @@ class ExperimentDB:
                 str(solver_path),
                 build_command,
                 source_hash,
+                parent_run_id,
                 json.dumps(params or {}, sort_keys=True),
                 time.time(),
             ),
@@ -386,6 +391,29 @@ class ExperimentDB:
         )
         self.conn.commit()
         return int(cur.lastrowid)
+
+    def list_merged_patches(self, limit: int = 3) -> list[dict[str, Any]]:
+        """Most recent merged patches joined with their trial run ids."""
+        rows = self.conn.execute(
+            """
+            select p.id, p.candidate_name, p.summary, p.created_at,
+                   t.base_run_id, t.new_run_id, t.role
+            from patches p
+            join autopilot_trials t on p.trial_id = t.id
+            where p.status = 'merged'
+            order by p.id desc limit ?
+            """,
+            (limit,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_trial(self, trial_id: int) -> dict[str, Any]:
+        row = self.conn.execute(
+            "select * from autopilot_trials where id = ?", (trial_id,)
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"trial not found: {trial_id}")
+        return dict(row)
 
     def record_agent_message(
         self, session_id: int | None, agent_name: str, role: str, content: str

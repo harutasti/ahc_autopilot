@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import os
 import random
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -16,8 +18,14 @@ from ahc_lab.db import ExperimentDB
 from ahc_lab.evaluator import Evaluator
 from ahc_lab.knowledge import search_knowledge
 from ahc_lab.policy import AcceptancePolicy, evaluate_acceptance
+from ahc_lab.runner import run_shell
 from ahc_lab.seeds import parse_seed_spec
-from ahc_lab.snapshots import restore_solver_source, snapshot_solver_source, store_dir_for
+from ahc_lab.snapshots import (
+    diff_snapshots,
+    restore_solver_source,
+    snapshot_solver_source,
+    store_dir_for,
+)
 
 
 ECHO_MINUS_TEN_SOLVER = """
@@ -65,6 +73,18 @@ int main() {
 ROOT = Path(__file__).resolve().parents[1]
 
 
+class RunnerTest(unittest.TestCase):
+    def test_timeout_kills_process_group(self) -> None:
+        marker = f"ahc_orphan_{os.getpid()}"
+        command = f"python3 -c \"import time; time.sleep(60) # {marker}\" && true"
+        result = run_shell(command, Path(tempfile.gettempdir()), timeout=1.0)
+        self.assertTrue(result.timed_out)
+        self.assertEqual(result.returncode, 124)
+        time.sleep(0.3)
+        leftover = subprocess.run(["pgrep", "-f", marker], capture_output=True, text=True)
+        self.assertEqual(leftover.stdout.strip(), "", "hung child survived the timeout kill")
+
+
 class SeedSpecTest(unittest.TestCase):
     def test_parse_seed_spec(self) -> None:
         self.assertEqual(parse_seed_spec("0-3"), [0, 1, 2, 3])
@@ -100,6 +120,11 @@ int main() {
             comparison = compare_runs(db, run_id, run_id_2)
             self.assertEqual(comparison["common_seed_count"], 3)
             self.assertEqual(comparison["losses"], 0)
+
+    def test_config_tool_timeouts(self) -> None:
+        config = load_problem_config(ROOT, "dummy")
+        self.assertEqual(config.generator_timeout_sec, 30.0)
+        self.assertEqual(config.score_timeout_sec, 60.0)
 
     def test_init_problem_creates_statement_templates(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_s:
@@ -242,6 +267,19 @@ class SnapshotTest(unittest.TestCase):
                 restored = (other / "solver" / "main.cpp").read_text(encoding="utf-8")
                 self.assertEqual(restored, ECHO_SOLVER)
 
+    def test_diff_snapshots(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_s:
+            tmp = Path(tmp_s)
+            (tmp / "solver").mkdir()
+            store = tmp / "store"
+            (tmp / "solver" / "main.cpp").write_text(ECHO_MINUS_TEN_SOLVER, encoding="utf-8")
+            base_hash = snapshot_solver_source(tmp, store)
+            (tmp / "solver" / "main.cpp").write_text(ECHO_SOLVER, encoding="utf-8")
+            new_hash = snapshot_solver_source(tmp, store)
+            diff = diff_snapshots(store, base_hash, new_hash)
+            self.assertIn("-    std::cout << target - 10 << '\\n';", diff)
+            self.assertIn("+    std::cout << target << '\\n';", diff)
+
     def test_snapshot_dedup_and_change_detection(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_s:
             tmp = Path(tmp_s)
@@ -306,6 +344,12 @@ target.write_text({ECHO_SOLVER!r}, encoding="utf-8")
                 "select status from autopilot_sessions where id = ?", (result.session_id,)
             ).fetchone()
             self.assertEqual(session["status"], "completed")
+            candidate_run = db.get_run(trial["new_run_id"])
+            self.assertEqual(candidate_run["parent_run_id"], result.baseline_run_id)
+            insights = (tmp / "knowledge" / "dummy_autopilot.md").read_text(encoding="utf-8")
+            self.assertIn("accepted", insights)
+            diffs = Autopilot(tmp, "dummy", db)._recent_accepted_diffs()
+            self.assertIn("target - 10", diffs)
 
     def test_no_merge_leaves_root_untouched(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_s:

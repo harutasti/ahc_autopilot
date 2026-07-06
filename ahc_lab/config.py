@@ -84,6 +84,8 @@ class ProblemConfig:
     score_command: str | None
     visualizer_command: str | None
     score_regex: str
+    generator_timeout_sec: float
+    score_timeout_sec: float
     raw: dict[str, Any]
 
     @property
@@ -112,6 +114,8 @@ def load_problem_config(root: Path, problem: str) -> ProblemConfig:
             str(data["visualizer_command"]) if data.get("visualizer_command") else None
         ),
         score_regex=str(data.get("score_regex", r"SCORE:\s*([-+0-9.eE]+)")),
+        generator_timeout_sec=float(data.get("generator_timeout_sec", 30.0)),
+        score_timeout_sec=float(data.get("score_timeout_sec", 60.0)),
         raw=data,
     )
 

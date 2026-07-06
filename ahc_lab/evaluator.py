@@ -106,9 +106,14 @@ class Evaluator:
         build_first: bool = True,
         jobs: int | None = None,
         use_cache: bool = True,
+        parent_run_id: int | None = None,
     ) -> int:
         run_id, run_dir, source_hash, params_json = self._start_run(
-            tag=tag, run_type=run_type, params=params, build_first=build_first
+            tag=tag,
+            run_type=run_type,
+            params=params,
+            build_first=build_first,
+            parent_run_id=parent_run_id,
         )
         all_ok = self._evaluate_batch(
             run_id,
@@ -135,6 +140,7 @@ class Evaluator:
         jobs: int | None = None,
         use_cache: bool = True,
         stage_sizes: tuple[int, ...] = (5, 30),
+        parent_run_id: int | None = None,
     ) -> tuple[int, dict[str, Any]]:
         """Evaluate in stages, aborting once the acceptance gate can no longer pass.
 
@@ -144,7 +150,11 @@ class Evaluator:
         and the run is finished with status `pruned`.
         """
         run_id, run_dir, source_hash, params_json = self._start_run(
-            tag=tag, run_type=run_type, params=params, build_first=build_first
+            tag=tag,
+            run_type=run_type,
+            params=params,
+            build_first=build_first,
+            parent_run_id=parent_run_id if parent_run_id is not None else baseline_run_id,
         )
         baseline_cases = {c["seed"]: c for c in self.db.list_cases(baseline_run_id)}
         stages = split_stages(list(seeds), stage_sizes)
@@ -185,6 +195,7 @@ class Evaluator:
         run_type: str,
         params: dict[str, Any] | None,
         build_first: bool,
+        parent_run_id: int | None = None,
     ) -> tuple[int, Path, str | None, str]:
         build = self.build() if build_first else None
         if build is not None and not build.ok:
@@ -200,6 +211,7 @@ class Evaluator:
             build_command=self.config.build_command,
             params=params,
             source_hash=source_hash,
+            parent_run_id=parent_run_id,
         )
         run_dir = self.root / "experiments" / "runs" / f"run_{run_id:06d}_{tag}"
         run_dir.mkdir(parents=True, exist_ok=True)
@@ -281,7 +293,7 @@ class Evaluator:
             gen_cmd = self.config.generator_command.format(
                 **self._vars(seed=seed, run_dir=run_dir, input_path=input_path, output_path=output_path)
             )
-            gen = run_shell(gen_cmd, self.root, timeout=30)
+            gen = run_shell(gen_cmd, self.root, timeout=self.config.generator_timeout_sec)
             if gen.returncode != 0:
                 input_path.write_text(gen.stdout, encoding="utf-8")
                 stderr_path.write_text(gen.stderr, encoding="utf-8")
@@ -311,7 +323,7 @@ class Evaluator:
             score_cmd = self.config.score_command.format(
                 **self._vars(seed=seed, run_dir=run_dir, input_path=input_path, output_path=output_path)
             )
-            scored = run_shell(score_cmd, self.root, timeout=30)
+            scored = run_shell(score_cmd, self.root, timeout=self.config.score_timeout_sec)
             stdout_text += scored.stdout
             stderr_text += scored.stderr
             if scored.returncode != 0:

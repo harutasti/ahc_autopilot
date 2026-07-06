@@ -85,6 +85,12 @@ Required fields:
 - `score_command`: Command that reads `{input}` and `{output}` and prints a score.
 - `score_regex`: Regular expression used to extract the numeric score from `score_command` output.
 
+Optional tool timeouts (heavy Python scorers can exceed the defaults under
+parallel load):
+
+- `generator_timeout_sec`: generator kill timeout (default 30).
+- `score_timeout_sec`: scorer kill timeout (default 60).
+
 Supported placeholders:
 
 - `{root}`: Project root.
@@ -206,6 +212,18 @@ next-best accepted candidate is tried instead.
 that the mean improvement is real rather than seed noise. Set
 `acceptance.min_improve_confidence` (e.g. `0.9`) in `config.yaml` to make the
 gate reject low-confidence improvements.
+
+Each generation also feeds the next ones:
+
+- **Lineage**: every run records `parent_run_id`, so the solution tree
+  (baseline → candidates → merged baselines) can be reconstructed from the DB.
+- **Insights**: trial results (decision, deltas, verdict reasons, prune info,
+  and the tail of the agent's own summary) are appended to
+  `knowledge/<problem>_autopilot.md`, which knowledge search feeds back into
+  future agent prompts — failed hypotheses are not silently retried.
+- **Inspirations**: prompts include unified diffs of the most recently merged
+  candidates so agents build on accepted changes instead of rediscovering or
+  undoing them.
 
 ## Evaluation performance
 
