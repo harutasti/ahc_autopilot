@@ -6,6 +6,8 @@ The project is built around a fast C++20 solver and a Python control plane that
 records experiments, evaluates candidates, exposes MCP tools, and prepares
 multi-agent AI work.
 
+Development phases — done and planned — are tracked in [ROADMAP.md](ROADMAP.md).
+
 ## Quick start
 
 ```bash
