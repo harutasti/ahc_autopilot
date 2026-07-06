@@ -99,6 +99,15 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="how many trials run concurrently per generation (default: all)",
     )
+    p.add_argument(
+        "--repair-attempts",
+        type=int,
+        default=0,
+        help=(
+            "on rejection or failure, feed the gate reasons and numbers back to the "
+            "same workspace agent and retry up to N times per trial (default: 0)"
+        ),
+    )
 
     p = sub.add_parser("source")
     p.add_argument("--run", type=int, required=True)
@@ -183,6 +192,7 @@ def main(argv: list[str] | None = None) -> int:
             generations=args.generations,
             validation_seeds=args.validation_seeds,
             trial_jobs=args.trial_jobs,
+            repair_attempts=args.repair_attempts,
         )
         print(json.dumps({
             "session_id": result.session_id,

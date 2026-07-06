@@ -227,6 +227,27 @@ Each generation also feeds the next ones:
   candidates so agents build on accepted changes instead of rediscovering or
   undoing them.
 
+## Repair loop
+
+With `--repair-attempts N`, a rejected candidate is not discarded immediately.
+The gate's verdict — rejection reasons, per-seed numbers (failures, worst
+worsening seeds, deltas, confidence), and elapsed times — is written as a
+repair prompt and fed back to the **same workspace agent**, up to N extra
+attempts per trial. The agent's previous change is still applied, so it can
+fix the diagnosis instead of the hypothesis being retried blind. Attempts that
+fail before scoring (build or adapter errors) are fed back the same way.
+
+The loop stops early when a repair leaves the source unchanged, since the
+verdict cannot change. Each attempt's run chains `parent_run_id` to the
+previous attempt, the attempt history is stored in the trial summary under
+`repair.attempts`, and the repair path (e.g. `rejected -> accepted`) is
+recorded in the insights file.
+
+```bash
+python3 tools/ahc.py autopilot --problem ahc067 --seeds 0-99 \
+  --generations 5 --agents 3 --repair-attempts 1
+```
+
 ## Evaluation performance
 
 Seed evaluation is parallel and cached:

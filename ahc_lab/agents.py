@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import shlex
 import time
@@ -141,6 +142,80 @@ workspace, implement the candidate change and leave a summary.
 """
 
 
+def build_repair_prompt(
+    *,
+    agent_name: str,
+    candidate_name: str,
+    attempt: int,
+    verdict: dict[str, Any] | None,
+    comparison: dict[str, Any] | None,
+    error: str | None,
+    original_prompt: str,
+) -> str:
+    """Feedback prompt for one repair attempt on a rejected or failed candidate.
+
+    The adapter is stateless, so the prompt embeds everything the agent needs:
+    the gate verdict with its measured numbers (or the failure text) plus the
+    original task prompt.
+    """
+    if error is not None:
+        diagnosis = (
+            "Your candidate failed before it could be scored:\n\n"
+            f"```\n{error}\n```\n\n"
+            "Fix the failure first (build error, tool crash, or timeout), then make\n"
+            "sure the candidate still implements your hypothesis."
+        )
+    else:
+        reasons = "\n".join(f"- {r}" for r in (verdict or {}).get("reasons") or [])
+        policy_desc = json.dumps((verdict or {}).get("policy") or {}, sort_keys=True)
+        diagnosis = (
+            "The acceptance gate rejected your candidate for these reasons:\n"
+            f"{reasons}\n\n"
+            "Measured numbers (candidate vs baseline):\n"
+            f"{_format_gate_numbers(comparison or {})}\n\n"
+            f"Gate policy: {policy_desc}"
+        )
+    return f"""You are {agent_name}. Your candidate `{candidate_name}` (attempt {attempt}) was NOT accepted.
+
+You are still in the same isolated workspace and your previous change is still
+applied. Repair the candidate instead of starting over.
+
+{diagnosis}
+
+Repair rules:
+- Diagnose the failure with the data above before editing.
+- Prefer the minimal fix: repair the failing seeds, remove the regression, or
+  keep only the part of your change that helps.
+- If the hypothesis itself is wrong, revert toward the baseline behavior and
+  try a smaller, safer variant.
+- Never write to files outside your current working directory.
+- Keep the C++20 solver valid for AtCoder submission; preserve output format,
+  reproducibility, and timer safety.
+
+Original task prompt (context only; the repair above takes priority):
+---
+{original_prompt}
+"""
+
+
+def _format_gate_numbers(comparison: dict[str, Any]) -> str:
+    lines = [
+        f"- mean effective delta: {comparison.get('mean_effective_delta')}",
+        f"- median effective delta: {comparison.get('median_effective_delta')}",
+        f"- wins/ties/losses: {comparison.get('wins')}/{comparison.get('ties')}/{comparison.get('losses')}",
+        f"- improve confidence: {comparison.get('improve_confidence')}",
+        f"- max elapsed sec: baseline {comparison.get('base_max_elapsed_sec')} -> "
+        f"candidate {comparison.get('new_max_elapsed_sec')}",
+    ]
+    failures = comparison.get("candidate_failures") or []
+    if failures:
+        lines.append(f"- failing seeds: {json.dumps(failures[:10])}")
+    worsening = comparison.get("worsening_seeds") or []
+    if worsening:
+        lines.append(f"- worst worsening seeds: {json.dumps(worsening[:10])}")
+    return "\n".join(lines)
+
+
 def read_problem_context(root: Path, problem: str, limit: int = 12000) -> str:
     problem_dir = root / "problems" / problem
     parts: list[str] = []
@@ -181,6 +256,7 @@ class Autopilot:
         generations: int = 1,
         validation_seeds: str | None = None,
         trial_jobs: int | None = None,
+        repair_attempts: int = 0,
     ) -> AutopilotResult:
         session_id = self.db.create_session(self.problem, budget_sec, agent_count)
         status = "aborted"
@@ -201,6 +277,7 @@ class Autopilot:
                 generations=generations,
                 validation_seeds=validation_seeds,
                 trial_jobs=trial_jobs,
+                repair_attempts=repair_attempts,
             )
             status = result.status
             return result
@@ -225,6 +302,7 @@ class Autopilot:
         generations: int,
         validation_seeds: str | None,
         trial_jobs: int | None,
+        repair_attempts: int,
     ) -> AutopilotResult:
         started = time.monotonic()
         seed_list = parse_seed_spec(seeds) or list(range(10))
@@ -332,6 +410,7 @@ class Autopilot:
                         use_cache=use_cache,
                         cascade=cascade,
                         session_id=session_id,
+                        repair_attempts=repair_attempts,
                         **trial,
                     )
                     for trial in trials
@@ -418,75 +497,154 @@ class Autopilot:
         use_cache: bool,
         cascade: bool,
         session_id: int,
+        repair_attempts: int = 0,
     ) -> TrialOutcome:
-        """Run one trial in a worker thread with its own DB connection."""
+        """Run one trial in a worker thread with its own DB connection.
+
+        With `repair_attempts` > 0, a rejected verdict (or a failed attempt) is
+        fed back to the same workspace agent as a repair prompt: the gate
+        reasons and measured numbers, so the agent fixes the candidate instead
+        of the hypothesis being retried blind. Retrying stops early when a
+        repair leaves the source unchanged, since the verdict cannot change.
+        """
         db = ExperimentDB(self.db.path)
         candidate_root = Path(workspace_path)
+        candidate_tag = f"autopilot_s{session_id}_{candidate_name}"
+        max_attempts = 1 + max(0, repair_attempts)
+        original_prompt = prompt_path.read_text(encoding="utf-8")
+        active_prompt_path = prompt_path
+        attempts: list[dict[str, Any]] = []
+        candidate_run_id: int | None = None
+        summary: dict[str, Any] | None = None
+        decision = "error"
+        mean_delta = 0.0
+        previous_hash: str | None = None
         try:
-            try:
-                self._run_adapter(adapter_command, prompt_path, candidate_root, trial_id=trial_id)
-                candidate_evaluator = Evaluator(candidate_root, self.problem, db)
-                candidate_tag = f"autopilot_s{session_id}_{candidate_name}"
-                cascade_info: dict[str, Any] | None = None
-                if cascade:
-                    candidate_run_id, cascade_info = candidate_evaluator.evaluate_cascade(
-                        seed_list,
-                        tag=candidate_tag,
-                        baseline_run_id=baseline_run_id,
-                        policy=policy,
-                        run_type="candidate",
-                        jobs=jobs,
-                        use_cache=use_cache,
+            for attempt in range(1, max_attempts + 1):
+                log_suffix = "" if attempt == 1 else f"_repair{attempt - 1}"
+                comparison: dict[str, Any] | None = None
+                verdict: dict[str, Any] | None = None
+                error_text: str | None = None
+                try:
+                    self._run_adapter(
+                        adapter_command,
+                        active_prompt_path,
+                        candidate_root,
+                        trial_id=trial_id,
+                        log_suffix=log_suffix,
                     )
-                else:
-                    candidate_run_id = candidate_evaluator.evaluate(
-                        seed_list,
-                        tag=candidate_tag,
-                        run_type="candidate",
-                        jobs=jobs,
-                        use_cache=use_cache,
+                    candidate_evaluator = Evaluator(candidate_root, self.problem, db)
+                    cascade_info: dict[str, Any] | None = None
+                    parent_run_id = (
+                        candidate_run_id if candidate_run_id is not None else baseline_run_id
                     )
-                comparison = compare_runs(db, baseline_run_id, candidate_run_id)
-                verdict = evaluate_acceptance(comparison, policy)
-                decision = verdict["decision"]
-                mean_delta = float(comparison.get("mean_effective_delta") or 0.0)
-                if decision == "rejected":
-                    db.update_scorecard(agent_name, False, mean_delta)
-                summary: dict[str, Any] = {**comparison, "acceptance": verdict}
-                if cascade_info is not None:
-                    summary["cascade"] = cascade_info
-                db.finish_trial(
-                    trial_id,
-                    status="evaluated",
-                    decision=decision,
-                    new_run_id=candidate_run_id,
-                    summary=summary,
-                )
-                return TrialOutcome(
-                    trial_id=trial_id,
+                    if cascade:
+                        run_id, cascade_info = candidate_evaluator.evaluate_cascade(
+                            seed_list,
+                            tag=candidate_tag + log_suffix,
+                            baseline_run_id=baseline_run_id,
+                            policy=policy,
+                            run_type="candidate",
+                            jobs=jobs,
+                            use_cache=use_cache,
+                            parent_run_id=parent_run_id,
+                        )
+                    else:
+                        run_id = candidate_evaluator.evaluate(
+                            seed_list,
+                            tag=candidate_tag + log_suffix,
+                            run_type="candidate",
+                            jobs=jobs,
+                            use_cache=use_cache,
+                            parent_run_id=parent_run_id,
+                        )
+                    comparison = compare_runs(db, baseline_run_id, run_id)
+                    verdict = evaluate_acceptance(comparison, policy)
+                    decision = verdict["decision"]
+                    source_hash = db.get_run(run_id).get("source_hash")
+                    no_change = (
+                        attempt > 1 and source_hash is not None and source_hash == previous_hash
+                    )
+                    attempt_row: dict[str, Any] = {
+                        "attempt": attempt,
+                        "run_id": run_id,
+                        "decision": decision,
+                        "reasons": verdict["reasons"],
+                    }
+                    if no_change:
+                        attempt_row["no_source_change"] = True
+                    attempts.append(attempt_row)
+                    candidate_run_id = run_id
+                    previous_hash = source_hash
+                    mean_delta = float(comparison.get("mean_effective_delta") or 0.0)
+                    summary = {**comparison, "acceptance": verdict}
+                    if cascade_info is not None:
+                        summary["cascade"] = cascade_info
+                    if decision != "rejected" or no_change or attempt == max_attempts:
+                        break
+                except Exception as exc:
+                    error_text = str(exc)
+                    attempts.append(
+                        {"attempt": attempt, "decision": "error", "reasons": [error_text]}
+                    )
+                    if attempt == max_attempts:
+                        if summary is None:
+                            raise
+                        break
+                repair_prompt = build_repair_prompt(
                     agent_name=agent_name,
                     candidate_name=candidate_name,
-                    workspace_path=workspace_path,
-                    decision=decision,
-                    candidate_run_id=candidate_run_id,
-                    mean_effective_delta=mean_delta,
-                    summary=summary,
+                    attempt=attempt,
+                    verdict=verdict,
+                    comparison=comparison,
+                    error=error_text,
+                    original_prompt=original_prompt,
                 )
-            except Exception as exc:
-                db.finish_trial(
-                    trial_id,
-                    status="failed",
-                    decision="error",
-                    summary={"error": str(exc)},
+                active_prompt_path = prompt_path.with_name(
+                    f"{candidate_name}_repair{attempt}.md"
                 )
-                return TrialOutcome(
-                    trial_id=trial_id,
-                    agent_name=agent_name,
-                    candidate_name=candidate_name,
-                    workspace_path=workspace_path,
-                    decision="error",
-                    summary={"error": str(exc)},
-                )
+                active_prompt_path.write_text(repair_prompt, encoding="utf-8")
+                db.record_agent_message(session_id, agent_name, "repair_prompt", repair_prompt)
+            assert summary is not None  # loop always breaks with a summary or raises
+            if len(attempts) > 1:
+                summary["repair"] = {"attempts": attempts}
+            if decision == "rejected":
+                db.update_scorecard(agent_name, False, mean_delta)
+            db.finish_trial(
+                trial_id,
+                status="evaluated",
+                decision=decision,
+                new_run_id=candidate_run_id,
+                summary=summary,
+            )
+            return TrialOutcome(
+                trial_id=trial_id,
+                agent_name=agent_name,
+                candidate_name=candidate_name,
+                workspace_path=workspace_path,
+                decision=decision,
+                candidate_run_id=candidate_run_id,
+                mean_effective_delta=mean_delta,
+                summary=summary,
+            )
+        except Exception as exc:
+            error_summary: dict[str, Any] = {"error": str(exc)}
+            if len(attempts) > 1:
+                error_summary["repair"] = {"attempts": attempts}
+            db.finish_trial(
+                trial_id,
+                status="failed",
+                decision="error",
+                summary=error_summary,
+            )
+            return TrialOutcome(
+                trial_id=trial_id,
+                agent_name=agent_name,
+                candidate_name=candidate_name,
+                workspace_path=workspace_path,
+                decision="error",
+                summary=error_summary,
+            )
         finally:
             db.close()
 
@@ -582,6 +740,10 @@ class Autopilot:
                 reasons = [summary["error"], *reasons]
             if reasons:
                 lines.append(f"- verdict: {'; '.join(str(r) for r in reasons if r)}\n")
+            repair_attempts = (summary.get("repair") or {}).get("attempts") or []
+            if repair_attempts:
+                path_desc = " -> ".join(str(a.get("decision")) for a in repair_attempts)
+                lines.append(f"- repair attempts: {len(repair_attempts)} ({path_desc})\n")
             if cascade.get("pruned"):
                 lines.append(f"- pruned early: {cascade.get('prune_reason')}\n")
             agent_note = self._adapter_log_tail(outcome.trial_id)
@@ -591,7 +753,16 @@ class Autopilot:
             fh.write("".join(lines))
 
     def _adapter_log_tail(self, trial_id: int, limit: int = 400) -> str:
-        path = self.root / "experiments" / "adapter_logs" / f"trial_{trial_id}.stdout.txt"
+        """Tail of the agent's stdout from the trial's latest (repair) attempt."""
+        log_dir = self.root / "experiments" / "adapter_logs"
+        path = log_dir / f"trial_{trial_id}.stdout.txt"
+        if log_dir.exists():
+            repairs = sorted(
+                log_dir.glob(f"trial_{trial_id}_repair*.stdout.txt"),
+                key=lambda p: int(p.name.split("_repair", 1)[1].split(".", 1)[0]),
+            )
+            if repairs:
+                path = repairs[-1]
         if not path.exists():
             return ""
         text = path.read_text(encoding="utf-8", errors="replace").strip()
@@ -613,7 +784,12 @@ class Autopilot:
         return source_hash
 
     def _run_adapter(
-        self, command: str, prompt_path: Path, cwd: Path, trial_id: int | None = None
+        self,
+        command: str,
+        prompt_path: Path,
+        cwd: Path,
+        trial_id: int | None = None,
+        log_suffix: str = "",
     ) -> None:
         rendered = command.format(prompt=shlex.quote(str(prompt_path)), cwd=shlex.quote(str(cwd)))
         env_cmd = os.path.expandvars(rendered)
@@ -621,7 +797,7 @@ class Autopilot:
         result = run_shell(env_cmd, cwd, timeout=timeout)
         log_dir = self.root / "experiments" / "adapter_logs"
         log_dir.mkdir(parents=True, exist_ok=True)
-        stem = f"trial_{trial_id}" if trial_id is not None else str(int(time.time()))
+        stem = f"trial_{trial_id}{log_suffix}" if trial_id is not None else str(int(time.time()))
         (log_dir / f"{stem}.stdout.txt").write_text(result.stdout, encoding="utf-8")
         (log_dir / f"{stem}.stderr.txt").write_text(result.stderr, encoding="utf-8")
         if result.returncode != 0:

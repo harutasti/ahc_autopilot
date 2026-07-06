@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import random
 import shutil
@@ -67,6 +68,21 @@ int main() {
     std::cout << target << '\\n';
     return 0;
 }
+"""
+
+ECHO_MINUS_TWENTY_SOLVER = """
+#include <iostream>
+int main() {
+    long long target;
+    if (!(std::cin >> target)) return 0;
+    std::cout << target - 20 << '\\n';
+    return 0;
+}
+"""
+
+BROKEN_SOLVER = """
+#include <iostream>
+int main() { this does not compile
 """
 
 
@@ -478,6 +494,117 @@ p.write_text({CRASHY_LARGE_TARGET_SOLVER!r}, encoding="utf-8")
             self.assertEqual(
                 (tmp / "solver" / "main.cpp").read_text(encoding="utf-8"),
                 ECHO_MINUS_TEN_SOLVER,
+            )
+
+
+class AutopilotRepairTest(unittest.TestCase):
+    def _run(self, tmp: Path, adapter_body: str, *, repair_attempts: int):
+        tmp = _make_dummy_root(tmp, ECHO_MINUS_TEN_SOLVER)
+        adapter = tmp / "adapter.py"
+        adapter.write_text(adapter_body, encoding="utf-8")
+        db = ExperimentDB.default(tmp)
+        result = Autopilot(tmp, "dummy", db).run(
+            budget_sec=None,
+            max_trials=1,
+            agent_count=1,
+            seeds="0-2",
+            adapter_command=f"{sys.executable} {adapter} {{cwd}}",
+            roles=["AnnealingBuilder"],
+            repair_attempts=repair_attempts,
+        )
+        trial = db.conn.execute(
+            "select * from autopilot_trials where session_id = ?", (result.session_id,)
+        ).fetchone()
+        return db, result, trial, json.loads(trial["summary_json"])
+
+    def test_rejected_candidate_is_repaired_after_feedback(self) -> None:
+        adapter_body = f"""import pathlib, sys
+p = pathlib.Path(sys.argv[1]) / "solver" / "main.cpp"
+if "target - 20" in p.read_text(encoding="utf-8"):
+    p.write_text({ECHO_SOLVER!r}, encoding="utf-8")
+else:
+    p.write_text({ECHO_MINUS_TWENTY_SOLVER!r}, encoding="utf-8")
+"""
+        with tempfile.TemporaryDirectory() as tmp_s:
+            tmp = Path(tmp_s)
+            db, result, trial, summary = self._run(tmp, adapter_body, repair_attempts=1)
+            self.assertEqual(trial["decision"], "accepted")
+            self.assertEqual(result.merged_count, 1)
+            self.assertEqual(
+                (tmp / "solver" / "main.cpp").read_text(encoding="utf-8"), ECHO_SOLVER
+            )
+            attempts = summary["repair"]["attempts"]
+            self.assertEqual([a["decision"] for a in attempts], ["rejected", "accepted"])
+            first_run = db.get_run(attempts[0]["run_id"])
+            second_run = db.get_run(attempts[1]["run_id"])
+            self.assertEqual(first_run["parent_run_id"], result.baseline_run_id)
+            self.assertEqual(second_run["parent_run_id"], attempts[0]["run_id"])
+            repair_prompt = (
+                result.prompt_dir / "g1_candidate_1_AnnealingBuilder_repair1.md"
+            ).read_text(encoding="utf-8")
+            self.assertIn("acceptance gate rejected", repair_prompt)
+            self.assertIn("Measured numbers", repair_prompt)
+            self.assertIn("Original task prompt", repair_prompt)
+            messages = db.conn.execute(
+                "select count(*) as n from agent_messages where role = 'repair_prompt'"
+            ).fetchone()["n"]
+            self.assertEqual(messages, 1)
+            insights = (tmp / "knowledge" / "dummy_autopilot.md").read_text(encoding="utf-8")
+            self.assertIn("repair attempts: 2 (rejected -> accepted)", insights)
+
+    def test_repair_stops_when_agent_makes_no_change(self) -> None:
+        adapter_body = f"""import pathlib, sys
+p = pathlib.Path(sys.argv[1]) / "solver" / "main.cpp"
+p.write_text({ECHO_MINUS_TWENTY_SOLVER!r}, encoding="utf-8")
+"""
+        with tempfile.TemporaryDirectory() as tmp_s:
+            tmp = Path(tmp_s)
+            db, result, trial, summary = self._run(tmp, adapter_body, repair_attempts=3)
+            self.assertEqual(trial["decision"], "rejected")
+            self.assertEqual(result.merged_count, 0)
+            attempts = summary["repair"]["attempts"]
+            self.assertEqual([a["decision"] for a in attempts], ["rejected", "rejected"])
+            self.assertTrue(attempts[1]["no_source_change"])
+            self.assertTrue(
+                (result.prompt_dir / "g1_candidate_1_AnnealingBuilder_repair1.md").exists()
+            )
+            self.assertFalse(
+                (result.prompt_dir / "g1_candidate_1_AnnealingBuilder_repair2.md").exists()
+            )
+
+    def test_failed_attempt_feeds_error_back_and_recovers(self) -> None:
+        adapter_body = f"""import pathlib, sys
+p = pathlib.Path(sys.argv[1]) / "solver" / "main.cpp"
+if "does not compile" in p.read_text(encoding="utf-8"):
+    p.write_text({ECHO_SOLVER!r}, encoding="utf-8")
+else:
+    p.write_text({BROKEN_SOLVER!r}, encoding="utf-8")
+"""
+        with tempfile.TemporaryDirectory() as tmp_s:
+            tmp = Path(tmp_s)
+            db, result, trial, summary = self._run(tmp, adapter_body, repair_attempts=1)
+            self.assertEqual(trial["decision"], "accepted")
+            self.assertEqual(result.merged_count, 1)
+            attempts = summary["repair"]["attempts"]
+            self.assertEqual([a["decision"] for a in attempts], ["error", "accepted"])
+            repair_prompt = (
+                result.prompt_dir / "g1_candidate_1_AnnealingBuilder_repair1.md"
+            ).read_text(encoding="utf-8")
+            self.assertIn("failed before it could be scored", repair_prompt)
+            self.assertIn("build failed", repair_prompt)
+
+    def test_repair_disabled_by_default_keeps_single_attempt(self) -> None:
+        adapter_body = f"""import pathlib, sys
+p = pathlib.Path(sys.argv[1]) / "solver" / "main.cpp"
+p.write_text({ECHO_MINUS_TWENTY_SOLVER!r}, encoding="utf-8")
+"""
+        with tempfile.TemporaryDirectory() as tmp_s:
+            tmp = Path(tmp_s)
+            db, result, trial, summary = self._run(tmp, adapter_body, repair_attempts=0)
+            self.assertEqual(trial["decision"], "rejected")
+            self.assertNotIn("repair", summary)
+            self.assertFalse(
+                (result.prompt_dir / "g1_candidate_1_AnnealingBuilder_repair1.md").exists()
             )
 
 
