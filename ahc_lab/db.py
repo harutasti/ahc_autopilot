@@ -280,6 +280,39 @@ class ExperimentDB:
         ).fetchall()
         return {int(row["seed"]): float(row["best"]) for row in rows}
 
+    def list_archive_runs(self, problem: str, tag_prefix: str) -> list[dict[str, Any]]:
+        """Fully finished baseline/candidate runs whose tag starts with a prefix.
+
+        `bad_cases` counts non-ok or unscored cases so callers can require
+        full seed coverage before treating the mean as a comparable fitness.
+        """
+        rows = self.conn.execute(
+            """
+            select r.id as run_id, r.source_hash, r.score_direction,
+                   avg(c.score) as mean_score,
+                   sum(case when c.status != 'ok' or c.score is null then 1 else 0 end)
+                       as bad_cases
+            from runs r join cases c on c.run_id = r.id
+            where r.problem = ? and r.status = 'done'
+              and r.run_type in ('baseline', 'candidate')
+              and r.source_hash is not null
+              and r.tag like ?
+            group by r.id
+            """,
+            (problem, tag_prefix + "%"),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def count_children(self) -> dict[int, int]:
+        """How many runs branched from each parent run."""
+        rows = self.conn.execute(
+            """
+            select parent_run_id as pid, count(*) as n from runs
+            where parent_run_id is not null group by parent_run_id
+            """
+        ).fetchall()
+        return {int(row["pid"]): int(row["n"]) for row in rows}
+
     def list_evaluated_sources(self, problem: str) -> list[dict[str, Any]]:
         """Distinct source hashes evaluated for a problem, with their first run."""
         rows = self.conn.execute(

@@ -116,6 +116,14 @@ def main(argv: list[str] | None = None) -> int:
             "comments/whitespace) to an already-evaluated run"
         ),
     )
+    p.add_argument(
+        "--archive",
+        action="store_true",
+        help=(
+            "sample each trial's starting source from the session's lineage archive "
+            "(weighted by fitness and novelty) instead of always branching from the mainline"
+        ),
+    )
 
     p = sub.add_parser("source")
     p.add_argument("--run", type=int, required=True)
@@ -202,6 +210,7 @@ def main(argv: list[str] | None = None) -> int:
             trial_jobs=args.trial_jobs,
             repair_attempts=args.repair_attempts,
             novelty_filter=not args.no_novelty_filter,
+            archive_parents=args.archive,
         )
         print(json.dumps({
             "session_id": result.session_id,

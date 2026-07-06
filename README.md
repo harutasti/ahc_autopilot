@@ -265,6 +265,28 @@ one being nondeterministically skipped. A repair attempt that leaves the
 source effectively unchanged (identical up to comments/whitespace) still stops
 the retry loop immediately. Disable the filter with `--no-novelty-filter`.
 
+## Archive evolution
+
+By default every trial branches from the current mainline. With `--archive`,
+each trial instead samples its **starting source** from the session's lineage
+archive: every fully evaluated baseline/candidate run of the session, one
+entry per distinct source. Sampling weight is `(1 + fitness rank) / (1 +
+children)` — better-scoring sources are preferred, but parents that already
+spawned many branches are discounted so unexplored lineage branches get their
+turn (the adaptive parent sampling idea from ShinkaEvolve/AlphaEvolve).
+
+The sampled parent's snapshot is restored into the trial workspace, the prompt
+briefs the agent on the parent run and notes the lineage, and the candidate's
+`parent_run_id` chains to the parent. The **acceptance gate is unchanged**: a
+candidate must still beat the mainline baseline to merge, so branching from a
+weaker parent can explore differently but never lowers the bar. The chosen
+parent is recorded in the trial summary under `archive_parent`.
+
+```bash
+python3 tools/ahc.py autopilot --problem ahc067 --seeds 0-99 \
+  --generations 8 --agents 3 --archive --repair-attempts 1
+```
+
 ## Evaluation performance
 
 Seed evaluation is parallel and cached:

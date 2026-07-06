@@ -10,9 +10,11 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from ahc_lab.agents import Autopilot, build_agent_prompt, select_specialists
 from ahc_lab.analysis import analyze_run, compare_runs
+from ahc_lab.archive import build_archive, sample_parents
 from ahc_lab.cli import _init_problem, _parse_roles
 from ahc_lab.config import load_problem_config
 from ahc_lab.db import ExperimentDB
@@ -762,6 +764,230 @@ else:
             )
             self.assertNotEqual(trial["decision"], "duplicate")
             self.assertIsNotNone(trial["new_run_id"])
+
+
+class ArchiveUnitTest(unittest.TestCase):
+    def _add_run(
+        self,
+        db: ExperimentDB,
+        *,
+        tag: str,
+        source_hash: str,
+        scores: list[float],
+        run_type: str = "candidate",
+        case_statuses: dict[int, str] | None = None,
+        parent: int | None = None,
+        status: str = "done",
+    ) -> int:
+        run_id = db.create_run(
+            problem="dummy",
+            tag=tag,
+            run_type=run_type,
+            score_direction="max",
+            solver_path=Path("solver"),
+            build_command="true",
+            source_hash=source_hash,
+            parent_run_id=parent,
+        )
+        for seed, score in enumerate(scores):
+            db.insert_case(
+                run_id=run_id,
+                seed=seed,
+                score=score,
+                elapsed_sec=0.01,
+                status=(case_statuses or {}).get(seed, "ok"),
+                input_path=Path("i"),
+                output_path=Path("o"),
+                stderr_path=Path("e"),
+            )
+        db.finish_run(run_id, status=status)
+        return run_id
+
+    def test_build_archive_filters_and_dedupes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_s:
+            db = ExperimentDB(Path(tmp_s) / "ahc.sqlite3")
+            baseline = self._add_run(
+                db, tag="autopilot_s1_baseline", run_type="baseline",
+                source_hash="hash_a", scores=[10.0, 10.0],
+            )
+            best = self._add_run(
+                db, tag="autopilot_s1_c1", source_hash="hash_b",
+                scores=[20.0, 20.0], parent=baseline,
+            )
+            self._add_run(  # same source again: deduped, earliest kept
+                db, tag="autopilot_s1_c2", source_hash="hash_b", scores=[20.0, 20.0],
+            )
+            self._add_run(  # pruned run: excluded
+                db, tag="autopilot_s1_c3", source_hash="hash_c",
+                scores=[30.0, 30.0], status="pruned",
+            )
+            self._add_run(  # failing case: excluded
+                db, tag="autopilot_s1_c4", source_hash="hash_d",
+                scores=[40.0, 40.0], case_statuses={1: "runtime_error"},
+            )
+            self._add_run(  # validation run type: excluded
+                db, tag="autopilot_s1_v1", run_type="validation",
+                source_hash="hash_e", scores=[50.0, 50.0],
+            )
+            self._add_run(  # other session: excluded
+                db, tag="autopilot_s2_c1", source_hash="hash_f", scores=[60.0, 60.0],
+            )
+            archive = build_archive(db, "dummy", "autopilot_s1_")
+            self.assertEqual(
+                [(e.run_id, e.source_hash) for e in archive],
+                [(baseline, "hash_a"), (best, "hash_b")],
+            )
+            by_id = {e.run_id: e for e in archive}
+            self.assertEqual(by_id[best].fitness, 20.0)
+            self.assertEqual(by_id[baseline].children, 1)
+            self.assertEqual(by_id[best].children, 0)
+            db.close()
+
+    def test_sample_parents_prefers_fit_and_novel(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_s:
+            db = ExperimentDB(Path(tmp_s) / "ahc.sqlite3")
+            weak = self._add_run(
+                db, tag="autopilot_s1_baseline", run_type="baseline",
+                source_hash="hash_a", scores=[10.0],
+            )
+            strong = self._add_run(
+                db, tag="autopilot_s1_c1", source_hash="hash_b", scores=[20.0],
+            )
+            for i in range(4):  # the weak parent is already well explored
+                self._add_run(
+                    db, tag=f"autopilot_s1_child{i}", source_hash=f"hash_child{i}",
+                    scores=[5.0], parent=weak, status="failed",
+                )
+            archive = build_archive(db, "dummy", "autopilot_s1_")
+            rng = random.Random(42)
+            picks = [sample_parents(archive, 1, rng=rng)[0].run_id for _ in range(300)]
+            self.assertGreater(picks.count(strong), picks.count(weak) * 2)
+            db.close()
+
+    def test_sample_parents_distinct_while_archive_allows(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_s:
+            db = ExperimentDB(Path(tmp_s) / "ahc.sqlite3")
+            for i in range(3):
+                self._add_run(
+                    db, tag=f"autopilot_s1_c{i}", source_hash=f"hash_{i}",
+                    scores=[float(i)],
+                )
+            archive = build_archive(db, "dummy", "autopilot_s1_")
+            picked = sample_parents(archive, 3, rng=random.Random(1))
+            self.assertEqual(len({e.run_id for e in picked}), 3)
+            picked_more = sample_parents(archive, 5, rng=random.Random(1))
+            self.assertEqual(len(picked_more), 5)
+            db.close()
+
+
+class AutopilotArchiveTest(unittest.TestCase):
+    def test_first_generation_archive_parent_is_baseline(self) -> None:
+        adapter_body = f"""import pathlib, sys
+p = pathlib.Path(sys.argv[1]) / "solver" / "main.cpp"
+p.write_text({ECHO_SOLVER!r}, encoding="utf-8")
+"""
+        with tempfile.TemporaryDirectory() as tmp_s:
+            tmp = _make_dummy_root(Path(tmp_s), ECHO_MINUS_TEN_SOLVER)
+            adapter = tmp / "adapter.py"
+            adapter.write_text(adapter_body, encoding="utf-8")
+            db = ExperimentDB.default(tmp)
+            result = Autopilot(tmp, "dummy", db).run(
+                budget_sec=None,
+                max_trials=1,
+                agent_count=1,
+                seeds="0-2",
+                adapter_command=f"{sys.executable} {adapter} {{cwd}}",
+                roles=["AnnealingBuilder"],
+                archive_parents=True,
+                archive_rng=random.Random(0),
+            )
+            trial = db.conn.execute(
+                "select * from autopilot_trials where session_id = ?", (result.session_id,)
+            ).fetchone()
+            summary = json.loads(trial["summary_json"])
+            self.assertEqual(trial["decision"], "accepted")
+            self.assertEqual(
+                summary["archive_parent"]["run_id"], result.baseline_run_id
+            )
+            prompt = (result.prompt_dir / "g1_candidate_1_AnnealingBuilder.md").read_text(
+                encoding="utf-8"
+            )
+            self.assertIn("archive parent run", prompt)
+
+    def test_archive_mode_branches_from_sampled_parent(self) -> None:
+        # The adapter only produces the winning candidate when its workspace
+        # starts from the seeded archive parent (echo-5), not the mainline.
+        adapter_body = f"""import pathlib, sys
+p = pathlib.Path(sys.argv[1]) / "solver" / "main.cpp"
+if "target - 5" in p.read_text(encoding="utf-8"):
+    p.write_text({ECHO_SOLVER!r}, encoding="utf-8")
+else:
+    p.write_text({ECHO_MINUS_TWENTY_SOLVER!r}, encoding="utf-8")
+"""
+        with tempfile.TemporaryDirectory() as tmp_s:
+            tmp = _make_dummy_root(Path(tmp_s), ECHO_MINUS_TEN_SOLVER)
+            adapter = tmp / "adapter.py"
+            adapter.write_text(adapter_body, encoding="utf-8")
+            db = ExperimentDB.default(tmp)
+            store = store_dir_for(db)
+            with tempfile.TemporaryDirectory() as seed_s:
+                seed_root = Path(seed_s)
+                (seed_root / "solver").mkdir()
+                (seed_root / "solver" / "main.cpp").write_text(
+                    ECHO_MINUS_FIVE_SOLVER, encoding="utf-8"
+                )
+                seeded_hash = snapshot_solver_source(seed_root, store)
+            seeded_run = db.create_run(
+                problem="dummy",
+                tag="autopilot_s1_seeded",
+                run_type="candidate",
+                score_direction="max",
+                solver_path=Path("solver"),
+                build_command="true",
+                source_hash=seeded_hash,
+            )
+            for seed in range(3):
+                db.insert_case(
+                    run_id=seeded_run,
+                    seed=seed,
+                    score=999_995.0,
+                    elapsed_sec=0.01,
+                    status="ok",
+                    input_path=Path("i"),
+                    output_path=Path("o"),
+                    stderr_path=Path("e"),
+                )
+            db.finish_run(seeded_run, status="done")
+
+            def pick_seeded(archive, count, rng=None):
+                return [next(e for e in archive if e.run_id == seeded_run)] * count
+
+            with mock.patch("ahc_lab.agents.sample_parents", pick_seeded):
+                result = Autopilot(tmp, "dummy", db).run(
+                    budget_sec=None,
+                    max_trials=1,
+                    agent_count=1,
+                    seeds="0-2",
+                    adapter_command=f"{sys.executable} {adapter} {{cwd}}",
+                    roles=["AnnealingBuilder"],
+                    archive_parents=True,
+                )
+            trial = db.conn.execute(
+                "select * from autopilot_trials where session_id = ?", (result.session_id,)
+            ).fetchone()
+            summary = json.loads(trial["summary_json"])
+            self.assertEqual(trial["decision"], "accepted")
+            self.assertEqual(result.merged_count, 1)
+            self.assertEqual(
+                (tmp / "solver" / "main.cpp").read_text(encoding="utf-8"), ECHO_SOLVER
+            )
+            self.assertEqual(summary["archive_parent"]["run_id"], seeded_run)
+            candidate_run = db.get_run(trial["new_run_id"])
+            self.assertEqual(candidate_run["parent_run_id"], seeded_run)
+            prompt = (result.prompt_dir / "g1_candidate_1_AnnealingBuilder.md").read_text(
+                encoding="utf-8"
+            )
+            self.assertIn(f"archive parent run {seeded_run}", prompt)
 
 
 class AcceptanceGateTest(unittest.TestCase):

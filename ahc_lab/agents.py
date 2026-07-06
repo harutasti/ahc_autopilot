@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import shlex
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -10,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from .analysis import analyze_run, compare_runs, make_ai_brief, write_analysis_markdown
+from .archive import ArchiveEntry, build_archive, sample_parents
 from .db import ExperimentDB
 from .evaluator import Evaluator, default_jobs
 from .knowledge import search_knowledge
@@ -102,11 +104,13 @@ def build_agent_prompt(
     knowledge_hits: list[dict[str, Any]],
     focus: str | None = None,
     recent_changes: str = "",
+    archive_note: str = "",
 ) -> str:
     responsibility = SPECIALISTS.get(agent_name) or REVIEWERS.get(agent_name) or "Improve the solver."
     brief = make_ai_brief(ExperimentDB.default(root), run_id)
     problem_context = read_problem_context(root, problem)
     focus_section = focus.strip() if focus and focus.strip() else "(no explicit focus; infer one scoped improvement from the analysis)"
+    archive_section = f"\nLineage:\n{archive_note}\n" if archive_note else ""
     return f"""You are {agent_name} in an autonomous AtCoder Heuristic Contest improvement lab.
 
 Responsibility:
@@ -130,7 +134,7 @@ Problem: {problem}
 
 Problem context:
 {problem_context}
-
+{archive_section}
 Current run brief:
 {brief}
 
@@ -284,6 +288,8 @@ class Autopilot:
         trial_jobs: int | None = None,
         repair_attempts: int = 0,
         novelty_filter: bool = True,
+        archive_parents: bool = False,
+        archive_rng: random.Random | None = None,
     ) -> AutopilotResult:
         session_id = self.db.create_session(self.problem, budget_sec, agent_count)
         status = "aborted"
@@ -306,6 +312,8 @@ class Autopilot:
                 trial_jobs=trial_jobs,
                 repair_attempts=repair_attempts,
                 novelty_filter=novelty_filter,
+                archive_parents=archive_parents,
+                archive_rng=archive_rng,
             )
             status = result.status
             return result
@@ -332,6 +340,8 @@ class Autopilot:
         trial_jobs: int | None,
         repair_attempts: int,
         novelty_filter: bool,
+        archive_parents: bool,
+        archive_rng: random.Random | None,
     ) -> AutopilotResult:
         started = time.monotonic()
         seed_list = parse_seed_spec(seeds) or list(range(10))
@@ -377,6 +387,14 @@ class Autopilot:
                 limit=6,
             )
             recent_changes = self._recent_accepted_diffs()
+            parents: list[ArchiveEntry] = []
+            if archive_parents and adapter_command:
+                session_archive = build_archive(
+                    self.db, self.problem, f"autopilot_s{session_id}_"
+                )
+                parents = sample_parents(
+                    session_archive, min(len(selected), max_trials), rng=archive_rng
+                )
             trials: list[dict[str, Any]] = []
             for idx, agent_name in enumerate(selected[:max_trials], start=1):
                 candidate_name = f"g{generation}_candidate_{idx}_{agent_name}"
@@ -389,15 +407,43 @@ class Autopilot:
                 workspace = create_candidate_workspace(
                     self.root, session_id=session_id, candidate_name=candidate_name
                 )
+                parent = parents[idx - 1] if idx <= len(parents) else None
+                prompt_run_id = baseline_run_id
+                prompt_analysis = analysis
+                archive_note = ""
+                archive_parent_info: dict[str, Any] | None = None
+                if parent is not None:
+                    archive_parent_info = {
+                        "run_id": parent.run_id,
+                        "source_hash": parent.source_hash,
+                        "mean_score": parent.mean_score,
+                        "children": parent.children,
+                    }
+                    if parent.run_id != baseline_run_id:
+                        restore_solver_source(
+                            store_dir_for(self.db),
+                            parent.source_hash,
+                            Path(workspace["path"]),
+                        )
+                        prompt_run_id = parent.run_id
+                        prompt_analysis = analyze_run(self.db, parent.run_id)
+                    archive_note = (
+                        f"Your workspace starts from archive parent run {parent.run_id} "
+                        f"(mean score {parent.mean_score}), sampled from the lineage tree "
+                        "by fitness and novelty. It may differ from the current mainline. "
+                        "The acceptance gate still compares your candidate against "
+                        f"mainline baseline run {baseline_run_id}."
+                    )
                 prompt = build_agent_prompt(
                     root=self.root,
                     problem=self.problem,
                     agent_name=agent_name,
-                    run_id=baseline_run_id,
-                    analysis=analysis,
+                    run_id=prompt_run_id,
+                    analysis=prompt_analysis,
                     knowledge_hits=knowledge_hits,
                     focus=focus,
                     recent_changes=recent_changes,
+                    archive_note=archive_note,
                 )
                 prompt_path = prompt_dir / f"{candidate_name}.md"
                 prompt_path.write_text(prompt, encoding="utf-8")
@@ -409,6 +455,8 @@ class Autopilot:
                         "candidate_name": candidate_name,
                         "workspace_path": workspace["path"],
                         "prompt_path": prompt_path,
+                        "lineage_parent_run_id": parent.run_id if parent else None,
+                        "archive_parent": archive_parent_info,
                     }
                 )
             if not adapter_command:
@@ -537,6 +585,8 @@ class Autopilot:
         session_id: int,
         repair_attempts: int = 0,
         novelty_index: dict[str, dict[str, int]] | None = None,
+        lineage_parent_run_id: int | None = None,
+        archive_parent: dict[str, Any] | None = None,
     ) -> TrialOutcome:
         """Run one trial in a worker thread with its own DB connection.
 
@@ -648,9 +698,12 @@ class Autopilot:
                             break
                     else:
                         candidate_evaluator = Evaluator(candidate_root, self.problem, db)
-                        parent_run_id = (
-                            candidate_run_id if candidate_run_id is not None else baseline_run_id
-                        )
+                        if candidate_run_id is not None:
+                            parent_run_id = candidate_run_id
+                        elif lineage_parent_run_id is not None:
+                            parent_run_id = lineage_parent_run_id
+                        else:
+                            parent_run_id = baseline_run_id
                         if cascade:
                             run_id, cascade_info = candidate_evaluator.evaluate_cascade(
                                 seed_list,
@@ -715,6 +768,8 @@ class Autopilot:
                 active_prompt_path.write_text(repair_prompt, encoding="utf-8")
                 db.record_agent_message(session_id, agent_name, "repair_prompt", repair_prompt)
             assert summary is not None  # loop always breaks with a summary or raises
+            if archive_parent is not None:
+                summary["archive_parent"] = archive_parent
             if len(attempts) > 1:
                 summary["repair"] = {"attempts": attempts}
             if decision in ("rejected", "duplicate"):
@@ -738,6 +793,8 @@ class Autopilot:
             )
         except Exception as exc:
             error_summary: dict[str, Any] = {"error": str(exc)}
+            if archive_parent is not None:
+                error_summary["archive_parent"] = archive_parent
             if len(attempts) > 1:
                 error_summary["repair"] = {"attempts": attempts}
             db.finish_trial(
