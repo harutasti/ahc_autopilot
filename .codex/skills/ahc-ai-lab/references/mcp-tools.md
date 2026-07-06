@@ -5,7 +5,10 @@ Use MCP tools for repeatable operations.
 ## Analysis
 
 - `analyze_run(run_id)`: score, time, status, and bad seed summary.
-- `compare_runs(base_run_id, new_run_id)`: seed-by-seed deltas and win/loss counts.
+- `compare_runs(base_run_id, new_run_id)`: seed-by-seed deltas, win/loss counts,
+  candidate failure counts, and max elapsed times.
+- `evaluate_acceptance(base_run_id, new_run_id)`: acceptance gate verdict
+  (`accepted` / `neutral` / `rejected`) with reasons and the applied policy.
 - `find_bad_seeds(run_id, limit)`: worst seeds for focused visual inspection.
 - `make_ai_brief(run_id)`: compact prompt input.
 
@@ -21,7 +24,8 @@ python tools/ahc.py ai-brief --run RUN_ID
 ## Evaluation
 
 - `build_solver(problem)`;
-- `evaluate_seeds(problem, seeds, tag)`.
+- `evaluate_seeds(problem, seeds, tag, jobs, use_cache)`: parallel evaluation,
+  cached by solver source hash.
 
 CLI fallback:
 

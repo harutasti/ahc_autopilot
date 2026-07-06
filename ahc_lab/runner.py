@@ -35,15 +35,22 @@ def run_shell(command: str, cwd: Path, timeout: float | None = None) -> CommandR
         return CommandResult(
             command=command,
             returncode=124,
-            stdout=exc.stdout or "",
-            stderr=exc.stderr or f"timeout after {timeout} sec",
+            stdout=_to_text(exc.stdout),
+            stderr=_to_text(exc.stderr) or f"timeout after {timeout} sec",
             elapsed_sec=elapsed,
             timed_out=True,
         )
+
+
+def _to_text(value: str | bytes | None) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return value
 
 
 def excerpt(text: str, limit: int = 2000) -> str:
     if len(text) <= limit:
         return text
     return text[: limit // 2] + "\n...[truncated]...\n" + text[-limit // 2 :]
-

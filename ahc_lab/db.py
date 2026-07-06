@@ -16,6 +16,7 @@ create table if not exists runs (
   score_direction text not null,
   solver_path text not null,
   build_command text not null,
+  source_hash text,
   params_json text not null default '{}',
   status text not null default 'running',
   created_at real not null,
@@ -34,6 +35,7 @@ create table if not exists cases (
   stderr_path text not null,
   stdout_excerpt text not null default '',
   stderr_excerpt text not null default '',
+  source_case_id integer,
   created_at real not null,
   unique(run_id, seed)
 );
@@ -136,8 +138,18 @@ class ExperimentDB:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(self.path)
         self.conn.row_factory = sqlite3.Row
+        self.conn.execute("pragma journal_mode=wal")
         self.conn.executescript(SCHEMA)
+        self._migrate()
         self.conn.commit()
+
+    def _migrate(self) -> None:
+        run_columns = {row[1] for row in self.conn.execute("pragma table_info(runs)")}
+        if "source_hash" not in run_columns:
+            self.conn.execute("alter table runs add column source_hash text")
+        case_columns = {row[1] for row in self.conn.execute("pragma table_info(cases)")}
+        if "source_case_id" not in case_columns:
+            self.conn.execute("alter table cases add column source_case_id integer")
 
     @classmethod
     def default(cls, root: Path) -> "ExperimentDB":
@@ -156,13 +168,14 @@ class ExperimentDB:
         solver_path: Path,
         build_command: str,
         params: dict[str, Any] | None = None,
+        source_hash: str | None = None,
     ) -> int:
         cur = self.conn.execute(
             """
             insert into runs
             (problem, tag, run_type, score_direction, solver_path, build_command,
-             params_json, created_at)
-            values (?, ?, ?, ?, ?, ?, ?, ?)
+             source_hash, params_json, created_at)
+            values (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 problem,
@@ -171,6 +184,7 @@ class ExperimentDB:
                 score_direction,
                 str(solver_path),
                 build_command,
+                source_hash,
                 json.dumps(params or {}, sort_keys=True),
                 time.time(),
             ),
@@ -198,13 +212,14 @@ class ExperimentDB:
         stderr_path: Path,
         stdout_excerpt: str = "",
         stderr_excerpt: str = "",
+        source_case_id: int | None = None,
     ) -> None:
         self.conn.execute(
             """
             insert or replace into cases
             (run_id, seed, score, elapsed_sec, status, input_path, output_path,
-             stderr_path, stdout_excerpt, stderr_excerpt, created_at)
-            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             stderr_path, stdout_excerpt, stderr_excerpt, source_case_id, created_at)
+            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 run_id,
@@ -217,10 +232,41 @@ class ExperimentDB:
                 str(stderr_path),
                 stdout_excerpt[:4000],
                 stderr_excerpt[:4000],
+                source_case_id,
                 time.time(),
             ),
         )
         self.conn.commit()
+
+    def find_cached_case(
+        self, *, problem: str, source_hash: str, seed: int, params_json: str = "{}"
+    ) -> dict[str, Any] | None:
+        """Find a previous ok case for the same source, seed, and params."""
+        row = self.conn.execute(
+            """
+            select c.* from cases c
+            join runs r on c.run_id = r.id
+            where r.problem = ? and r.source_hash = ? and r.params_json = ?
+              and c.seed = ? and c.status = 'ok' and c.score is not null
+            order by c.id desc limit 1
+            """,
+            (problem, source_hash, params_json, seed),
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def best_scores(self, problem: str, *, maximize: bool) -> dict[int, float]:
+        """Best known ok score per seed across all runs of a problem."""
+        agg = "max" if maximize else "min"
+        rows = self.conn.execute(
+            f"""
+            select c.seed as seed, {agg}(c.score) as best from cases c
+            join runs r on c.run_id = r.id
+            where r.problem = ? and c.status = 'ok' and c.score is not null
+            group by c.seed
+            """,
+            (problem,),
+        ).fetchall()
+        return {int(row["seed"]): float(row["best"]) for row in rows}
 
     def get_run(self, run_id: int) -> dict[str, Any]:
         row = self.conn.execute("select * from runs where id = ?", (run_id,)).fetchone()
@@ -320,6 +366,25 @@ class ExperimentDB:
             ),
         )
         self.conn.commit()
+
+    def record_patch(
+        self,
+        *,
+        trial_id: int | None,
+        candidate_name: str,
+        path: str,
+        summary: str,
+        status: str = "created",
+    ) -> int:
+        cur = self.conn.execute(
+            """
+            insert into patches (trial_id, candidate_name, path, summary, status, created_at)
+            values (?, ?, ?, ?, ?, ?)
+            """,
+            (trial_id, candidate_name, path, summary, status, time.time()),
+        )
+        self.conn.commit()
+        return int(cur.lastrowid)
 
     def record_agent_message(
         self, session_id: int | None, agent_name: str, role: str, content: str

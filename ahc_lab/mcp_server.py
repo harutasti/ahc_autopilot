@@ -8,10 +8,11 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .analysis import analyze_run, compare_runs, find_bad_seeds, make_ai_brief
-from .config import project_root_from
+from .config import load_problem_config, project_root_from
 from .db import ExperimentDB
 from .evaluator import Evaluator
 from .knowledge import search_knowledge
+from .policy import AcceptancePolicy, evaluate_acceptance
 from .seeds import parse_seed_spec
 from .workspace import create_candidate_workspace, list_candidate_workspaces
 
@@ -78,6 +79,17 @@ def tool_defs() -> dict[str, ToolDef]:
             lambda root, a: {"brief": make_ai_brief(ExperimentDB.default(root), int(a["run_id"]))},
         ),
         ToolDef(
+            "evaluate_acceptance",
+            "Compare two runs and apply the problem acceptance gate; "
+            "returns accepted/neutral/rejected with reasons.",
+            _schema(
+                {"base_run_id": {"type": "integer"}, "new_run_id": {"type": "integer"}},
+                ["base_run_id", "new_run_id"],
+            ),
+            "analysis",
+            _evaluate_acceptance_tool,
+        ),
+        ToolDef(
             "build_solver",
             "Build the solver for a problem.",
             _schema({"problem": {"type": "string"}}, ["problem"]),
@@ -86,12 +98,14 @@ def tool_defs() -> dict[str, ToolDef]:
         ),
         ToolDef(
             "evaluate_seeds",
-            "Build and evaluate a problem on a seed spec.",
+            "Build and evaluate a problem on a seed spec (parallel, cached by source hash).",
             _schema(
                 {
                     "problem": {"type": "string"},
                     "seeds": {"type": "string", "default": "0-9"},
                     "tag": {"type": "string", "default": "mcp"},
+                    "jobs": {"type": "integer"},
+                    "use_cache": {"type": "boolean", "default": True},
                 },
                 ["problem"],
             ),
@@ -172,12 +186,22 @@ def _build_solver(root: Path, args: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _evaluate_acceptance_tool(root: Path, args: dict[str, Any]) -> dict[str, Any]:
+    db = ExperimentDB.default(root)
+    comparison = compare_runs(db, int(args["base_run_id"]), int(args["new_run_id"]))
+    config = load_problem_config(root, comparison["problem"])
+    verdict = evaluate_acceptance(comparison, AcceptancePolicy.from_config(config))
+    return {"comparison": comparison, "acceptance": verdict}
+
+
 def _evaluate_seeds(root: Path, args: dict[str, Any]) -> dict[str, Any]:
     db = ExperimentDB.default(root)
     run_id = Evaluator(root, str(args["problem"]), db).evaluate(
         parse_seed_spec(str(args.get("seeds", "0-9"))),
         tag=str(args.get("tag", "mcp")),
         run_type="mcp",
+        jobs=int(args["jobs"]) if args.get("jobs") is not None else None,
+        use_cache=bool(args.get("use_cache", True)),
     )
     return {"run_id": run_id, "analysis": analyze_run(db, run_id)}
 

@@ -6,14 +6,16 @@ import os
 import shutil
 from pathlib import Path
 
-from .agents import Autopilot
+from .agents import REVIEWERS, SPECIALISTS, Autopilot
 from .analysis import analyze_run, compare_runs, find_bad_seeds, make_ai_brief, write_analysis_markdown
-from .config import project_root_from
+from .config import load_problem_config, project_root_from
 from .db import ExperimentDB
 from .evaluator import Evaluator
 from .knowledge import search_knowledge
 from .mcp_server import run_server_cli
+from .policy import AcceptancePolicy, evaluate_acceptance
 from .seeds import parse_seed_spec
+from .snapshots import restore_solver_source, snapshot_solver_source, store_dir_for
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -28,6 +30,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--problem", required=True)
     p.add_argument("--seeds", default="0-9")
     p.add_argument("--tag", default="manual")
+    p.add_argument("--jobs", type=int, default=None, help="parallel seed workers (default: cpu count - 1)")
+    p.add_argument("--no-cache", action="store_true", help="re-evaluate even if this source was already scored")
 
     p = sub.add_parser("analyze")
     p.add_argument("--run", type=int, required=True)
@@ -56,6 +60,36 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--agents", type=int, default=4)
     p.add_argument("--seeds", default="0-9")
     p.add_argument("--adapter", default=None, help="shell command, defaults to AHC_AI_COMMAND")
+    p.add_argument(
+        "--roles",
+        default=None,
+        help="comma-separated specialist/reviewer names; overrides automatic selection",
+    )
+    p.add_argument(
+        "--focus",
+        default=None,
+        help="scoped improvement hypothesis injected into every agent prompt",
+    )
+    p.add_argument(
+        "--no-merge",
+        action="store_true",
+        help="do not copy accepted candidate sources back into solver/",
+    )
+    p.add_argument("--jobs", type=int, default=None, help="parallel seed workers (default: cpu count - 1)")
+    p.add_argument("--no-cache", action="store_true", help="re-evaluate even if a source was already scored")
+    p.add_argument(
+        "--no-cascade",
+        action="store_true",
+        help="evaluate candidates on all seeds instead of staged evaluation with early pruning",
+    )
+
+    p = sub.add_parser("source")
+    p.add_argument("--run", type=int, required=True)
+    p.add_argument(
+        "--checkout",
+        action="store_true",
+        help="restore the run's solver source into solver/ (current source is snapshotted first)",
+    )
 
     p = sub.add_parser("knowledge")
     p.add_argument("query")
@@ -77,7 +111,10 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if result.ok else 1
     if args.cmd == "run":
         run_id = Evaluator(root, args.problem, db).evaluate(
-            parse_seed_spec(args.seeds), tag=args.tag
+            parse_seed_spec(args.seeds),
+            tag=args.tag,
+            jobs=args.jobs,
+            use_cache=not args.no_cache,
         )
         print(json.dumps({"run_id": run_id}, indent=2))
         return 0
@@ -89,6 +126,12 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.cmd == "compare":
         data = compare_runs(db, args.base, args.new)
+        try:
+            config = load_problem_config(root, data["problem"])
+        except FileNotFoundError:
+            pass
+        else:
+            data["acceptance"] = evaluate_acceptance(data, AcceptancePolicy.from_config(config))
         if args.markdown:
             write_analysis_markdown(args.markdown, "Run Comparison", data)
         print(json.dumps(data, indent=2, sort_keys=True))
@@ -114,6 +157,12 @@ def main(argv: list[str] | None = None) -> int:
             agent_count=args.agents,
             seeds=args.seeds,
             adapter_command=args.adapter or os.environ.get("AHC_AI_COMMAND"),
+            roles=_parse_roles(args.roles),
+            focus=args.focus,
+            merge_accepted=not args.no_merge,
+            jobs=args.jobs,
+            use_cache=not args.no_cache,
+            cascade=not args.no_cascade,
         )
         print(json.dumps({
             "session_id": result.session_id,
@@ -121,6 +170,27 @@ def main(argv: list[str] | None = None) -> int:
             "prompt_dir": str(result.prompt_dir),
             "selected_agents": result.selected_agents,
             "status": result.status,
+            "final_baseline_run_id": result.final_baseline_run_id,
+            "merged_count": result.merged_count,
+        }, indent=2))
+        return 0
+    if args.cmd == "source":
+        run = db.get_run(args.run)
+        source_hash = run.get("source_hash")
+        if not source_hash:
+            print(json.dumps({"run_id": args.run, "error": "run has no source snapshot"}))
+            return 1
+        store = store_dir_for(db)
+        previous_hash = None
+        if args.checkout:
+            previous_hash = snapshot_solver_source(root, store)
+            restore_solver_source(store, source_hash, root)
+        print(json.dumps({
+            "run_id": args.run,
+            "source_hash": source_hash,
+            "snapshot_dir": str(store / source_hash),
+            "checked_out": bool(args.checkout),
+            "previous_source_hash": previous_hash,
         }, indent=2))
         return 0
     if args.cmd == "knowledge":
@@ -146,6 +216,17 @@ def _parse_budget(value: str | None) -> float | None:
     return float(value)
 
 
+def _parse_roles(value: str | None) -> list[str] | None:
+    if value is None or not value.strip():
+        return None
+    valid = set(SPECIALISTS) | set(REVIEWERS)
+    roles = [item.strip() for item in value.split(",") if item.strip()]
+    unknown = [role for role in roles if role not in valid]
+    if unknown:
+        raise ValueError(f"unknown role(s): {', '.join(unknown)}; valid roles: {', '.join(sorted(valid))}")
+    return roles
+
+
 def _init_problem(root: Path, name: str) -> None:
     src = root / "problems" / "dummy"
     dest = root / "problems" / name
@@ -153,10 +234,81 @@ def _init_problem(root: Path, name: str) -> None:
         raise FileExistsError(dest)
     shutil.copytree(src, dest)
     config = dest / "config.yaml"
-    text = config.read_text(encoding="utf-8").replace("name: dummy", f"name: {name}")
-    config.write_text(text, encoding="utf-8")
+    config.write_text(_config_template(name), encoding="utf-8")
+    (dest / "statement.md").write_text(_statement_template(name), encoding="utf-8")
+    (dest / "problem_brief.md").write_text(_problem_brief_template(name), encoding="utf-8")
+
+
+def _config_template(name: str) -> str:
+    return f"""# Problem name. Usually the same as this directory name.
+name: {name}
+
+# Use `max` when larger scores are better, or `min` when smaller scores are better.
+score_direction: max
+
+# Solver timeout in seconds. Set this to the contest time limit.
+time_limit_sec: 2
+
+# Build solver/main.cpp into the {{solver}} path.
+build_command: g++ -std=c++20 -O2 -pipe -Wall -Wextra -o {{build_dir}}/solver solver/main.cpp
+
+# Generate one input for {{seed}} and write it to {{input}}.
+# Replace this with the official generator command for real contests.
+generator_command: python3 {{problem_dir}}/tools/generator.py --seed {{seed}} > {{input}}
+
+# Run the built solver with {{input}} and write solver output to {{output}}.
+run_command: "{{solver}} < {{input}} > {{output}}"
+
+# Score one {{input}} / {{output}} pair.
+# Replace this with the official tester/scorer/visualizer command.
+score_command: python3 {{problem_dir}}/tools/scorer.py {{input}} {{output}}
+
+# Regex used to extract a numeric score from score_command output.
+# The default expects output like: SCORE: 123456
+score_regex: SCORE:\\s*([-+0-9.eE]+)
+
+# Optional acceptance gate overrides used by autopilot and `compare`.
+# Defaults: no worsening seed allowed, max elapsed = time_limit_sec.
+# acceptance:
+#   max_worsening_seeds: 0
+#   max_worsening_delta: 0
+#   max_elapsed_sec: 1.9
+#   neutral_speedup_ratio: 0.05
+"""
+
+
+def _statement_template(name: str) -> str:
+    return f"""# {name}
+
+## Goal
+
+## Input
+
+## Output
+
+## Constraints
+
+## Score
+
+## Validity
+
+## Notes
+"""
+
+
+def _problem_brief_template(name: str) -> str:
+    return f"""# {name} Brief
+
+Fill this after reading `statement.md`.
+
+- State:
+- Score parts:
+- Valid output constraints:
+- Baseline idea:
+- Likely strategies:
+- Known risks:
+"""
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

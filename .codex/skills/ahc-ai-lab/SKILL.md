@@ -24,7 +24,7 @@ seed evaluation.
 
 Use project MCP tools when available:
 
-- `analysis-mcp`: `analyze_run`, `compare_runs`, `find_bad_seeds`, `make_ai_brief`.
+- `analysis-mcp`: `analyze_run`, `compare_runs`, `evaluate_acceptance`, `find_bad_seeds`, `make_ai_brief`.
 - `evaluation-mcp`: `build_solver`, `evaluate_seeds`.
 - `experiment-db-mcp`: `list_runs`, `get_run`, `get_agent_scorecard`.
 - `workspace-mcp`: `create_candidate_workspace`, `list_candidate_workspaces`.
@@ -39,6 +39,7 @@ Use `ProblemAnalyst` first when the problem structure or current weakness is
 unclear. Then select two to four specialists:
 
 - `BeamSearchBuilder`: state ranking, pruning, transition generation, duplicate removal.
+- `CutBuilder`: graph cuts, separators, bottlenecks, multi-edge doors, switch placement.
 - `AnnealingBuilder`: neighborhoods, delta evaluation, rollback, schedule, time split.
 - `GreedyConstructiveBuilder`: initial solution and constructive ordering.
 - `StateDesignBuilder`: state representation, score decomposition, cache, undo/redo.
@@ -63,7 +64,12 @@ Reject or hold a candidate unless all required checks pass:
 - elapsed time stays below the contest limit;
 - correctness review approves.
 
-AI judgment is advisory. Numeric evaluation decides.
+AI judgment is advisory. Numeric evaluation decides. Use the
+`evaluate_acceptance` tool (or `python tools/ahc.py compare`) for the verdict:
+it rejects candidates that fail or miss seeds the baseline solves, exceed the
+worsening budget from the problem `acceptance` config, or exceed the elapsed
+limit. A score-neutral candidate that passes every safety check is `neutral`,
+not `rejected`; keep it as a performance-driven follow-up.
 
 ## References
 
@@ -75,4 +81,3 @@ Read these only when relevant:
 - `references/multi-agent-roles.md`: role outputs and handoff contracts.
 - `references/mcp-tools.md`: exact MCP/CLI tool mapping.
 - `references/external-notes.md`: audited external AHC references.
-

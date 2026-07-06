@@ -19,6 +19,13 @@ Return:
 Keep changes narrow. Do not mix algorithm strategy, parameter tuning, and
 performance refactoring in one candidate unless explicitly assigned.
 
+## CutBuilder
+
+Use for graph problems where poor seeds suggest bridge, separator, min-cut,
+bottleneck, or mandatory-passage structure. Keep candidates scoped to cut
+generation, multi-edge door placement, switch placement, and fallback behavior.
+Do not mix in broad annealing rewrites unless explicitly assigned.
+
 ## Reviewers
 
 Return one verdict:
@@ -35,4 +42,3 @@ actually improve the measured bad cases.
 
 Tune only after an implementation has positive signal. Store parameter sets and
 seed sets. Prefer robust median improvement over a fragile high mean.
-

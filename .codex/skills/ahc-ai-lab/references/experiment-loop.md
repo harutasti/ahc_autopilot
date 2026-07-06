@@ -10,6 +10,7 @@ For every trial, save:
 
 - baseline run id;
 - candidate run id;
+- source hashes (recorded automatically on each run; restore with `python tools/ahc.py source --run ID --checkout`);
 - agent and hypothesis;
 - changed files;
 - mean and median effective delta;

@@ -72,6 +72,77 @@ score_command: python3 {problem_dir}/tools/scorer.py {input} {output}
 score_regex: SCORE:\s*([-+0-9.eE]+)
 ```
 
+### `config.yaml` fields
+
+Required fields:
+
+- `name`: Problem name. Usually the same as the directory name, such as `ahc001`.
+- `score_direction`: Use `max` when a larger score is better, or `min` when a smaller score is better.
+- `time_limit_sec`: Solver timeout in seconds. Set this to the contest time limit.
+- `build_command`: Command that builds `solver/main.cpp` into `{solver}`.
+- `generator_command`: Command that creates one input file from `{seed}` and writes it to `{input}`.
+- `run_command`: Command that runs the built solver with `{input}` and writes `{output}`.
+- `score_command`: Command that reads `{input}` and `{output}` and prints a score.
+- `score_regex`: Regular expression used to extract the numeric score from `score_command` output.
+
+Supported placeholders:
+
+- `{root}`: Project root.
+- `{problem}`: Problem name from `config.yaml`.
+- `{problem_dir}`: `problems/<contest>`.
+- `{build_dir}`: Build output directory under `.ahc_lab/build/<contest>`.
+- `{solver}`: Built solver path, normally `{build_dir}/solver`.
+- `{seed}`: Current seed.
+- `{run_dir}`: Current experiment run directory.
+- `{input}`: Current seed input file.
+- `{output}`: Current seed solver output file.
+
+`score_command` must print text that matches `score_regex`. The default expects:
+
+```text
+SCORE: 123456
+```
+
+If an official tool prints a different format, change `score_regex`. For example:
+
+```yaml
+score_regex: "Score =\\s*([-+0-9.eE]+)"
+```
+
+Keep the config simple: this project reads a small YAML subset intended for
+plain key-value settings. Avoid lists, anchors, multiline strings, and complex
+YAML features in `config.yaml`.
+
+### Acceptance gate
+
+`autopilot` and `compare` judge a candidate run against its baseline with a
+numeric gate. A candidate is rejected when any safety check fails:
+
+- it fails or misses a seed the baseline solves;
+- more seeds worsen than `max_worsening_seeds` allows;
+- the worst per-seed effective worsening exceeds `max_worsening_delta`;
+- the median effective delta is negative;
+- any case exceeds `max_elapsed_sec`.
+
+Otherwise the decision is `accepted` when the mean effective delta is positive,
+when the candidate fixes previously failing seeds without score regression, or
+when a score-neutral candidate is measurably faster. A score-neutral candidate
+with no measurable speedup is recorded as `neutral` (held for review) instead
+of `rejected`, and does not count against the agent scorecard.
+
+Override the defaults with an optional `acceptance` block in `config.yaml`:
+
+```yaml
+acceptance:
+  max_worsening_seeds: 0      # seeds allowed to get worse (default 0)
+  max_worsening_delta: 0      # largest allowed per-seed effective worsening (default 0)
+  max_elapsed_sec: 1.9        # elapsed cap; defaults to time_limit_sec
+  neutral_speedup_ratio: 0.05 # max-elapsed speedup needed to accept a score-neutral candidate
+```
+
+The verdict (decision plus reasons) is included in `compare` output, stored in
+each autopilot trial summary, and exposed as the `evaluate_acceptance` MCP tool.
+
 For a real contest such as AHC001, the minimum human setup is:
 
 ```bash
@@ -88,6 +159,69 @@ Then:
 A valid baseline does not need to be strong. It only needs to compile, respect
 the output format, and pass the official tester/scorer so autopilot has a safe
 starting point.
+
+## Autopilot targeting
+
+By default, `autopilot` selects specialists from the latest baseline analysis.
+For a known hypothesis, pin the role and pass a narrow focus:
+
+```bash
+python3 tools/ahc.py autopilot \
+  --problem ahc067 \
+  --seeds 62,63,36,53 \
+  --max-trials 1 \
+  --agents 1 \
+  --roles CutBuilder \
+  --focus "Add BFS distance-layer s-t cut candidates: create multi-edge closed-door cuts with one switch, keep the current bridge portfolio as fallback, and accept only if low-score seeds improve without losses."
+```
+
+Useful roles include `ProblemAnalyst`, `CutBuilder`, `AnnealingBuilder`,
+`StateDesignBuilder`, `PerformanceBuilder`, and `ParameterTuner`. `--roles`
+overrides automatic specialist selection; `--focus` is injected into every agent
+prompt so candidates stay scoped.
+
+## Evaluation performance
+
+Seed evaluation is parallel and cached:
+
+- **Parallel seeds**: `run` and `autopilot` evaluate seeds on `cpu count - 1`
+  workers by default. Override with `--jobs N`. Use `--jobs 1` when you need
+  precise elapsed-time measurements (parallel runs contend for cores, which
+  adds timing noise and can slightly reduce scores of time-budgeted solvers).
+- **Source-hash cache**: a seed already scored for the same solver source and
+  params is reused instead of re-run; the copied case records its origin in
+  `source_case_id`. Disable with `--no-cache`. Re-evaluating an unchanged
+  solver costs almost nothing.
+- **Cascade with early pruning**: autopilot candidates are evaluated in stages
+  (5 seeds, then 30, then the rest). If a stage produces an unrecoverable gate
+  failure — a failed seed, an over-limit case, or more worsening seeds than the
+  acceptance budget — the remaining seeds are skipped and the run is marked
+  `pruned`. Disable with `--no-cascade`.
+- **Relative scores**: `analyze` and `compare` report `mean_relative_score`
+  against the best known score per seed across all runs (virtual best), which
+  is scale-independent and matches AHC relative scoring. Failed cases count
+  as 0.
+
+## Source snapshots and the merge loop
+
+Every evaluated run stores a content-addressed snapshot of `solver/` under
+`experiments/sources/<hash>/` and records the hash on the run row, so any
+historical run's exact source can be inspected or restored:
+
+```bash
+python3 tools/ahc.py source --run 42             # show the snapshot location
+python3 tools/ahc.py source --run 42 --checkout  # restore it into solver/
+```
+
+`--checkout` snapshots the current `solver/` first, so the pre-checkout source
+is always recoverable via the printed `previous_source_hash`.
+
+When an autopilot trial is `accepted`, its source is automatically merged back
+into the mainline `solver/`, the merge is recorded in the `patches` table, and
+later trials in the same session compare against the new baseline run. Pass
+`--no-merge` to keep the old record-only behavior. Because the merged source
+was already snapshotted by the candidate evaluation, a merge can never lose
+code: the previous mainline source stays available from the baseline run.
 
 ## MCP servers
 
