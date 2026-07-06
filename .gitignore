@@ -9,4 +9,7 @@ worktrees/
 *.err
 *.exe
 solver/solver
-
+.DS_Store
+*.un~
+target/
+out.svg

@@ -1,0 +1,26 @@
+# Problem name. Usually the same as this directory name.
+name: ahc001
+
+# Use `max` when larger scores are better, or `min` when smaller scores are better.
+score_direction: max
+
+# Solver timeout in seconds. Set this to the contest time limit.
+time_limit_sec: 5
+
+# Build solver/main.cpp into the {solver} path.
+build_command: g++ -std=c++20 -O2 -pipe -Wall -Wextra -o {build_dir}/solver solver/main.cpp
+
+# Generate one input for {seed} and write it to {input}.
+# Replace this with the official generator command for real contests.
+generator_command: python3 {problem_dir}/tools/generator.py --seed {seed} > {input}
+
+# Run the built solver with {input} and write solver output to {output}.
+run_command: "{solver} < {input} > {output}"
+
+# Score one {input} / {output} pair.
+# Replace this with the official tester/scorer/visualizer command.
+score_command: python3 {problem_dir}/tools/scorer.py {input} {output}
+
+# Regex used to extract a numeric score from score_command output.
+# The default expects output like: SCORE: 123456
+score_regex: SCORE:\s*([-+0-9.eE]+)
