@@ -287,6 +287,28 @@ python3 tools/ahc.py autopilot --problem ahc067 --seeds 0-99 \
   --generations 8 --agents 3 --archive --repair-attempts 1
 ```
 
+## Dynamic roles
+
+By default each generation's trial roles come from a static specialist catalog
+(`select_specialists`). With `--dynamic-roles`, an **orchestrator LLM** —
+invoked through the same adapter command as the trials, so no extra API setup
+— studies the latest analysis, knowledge hits, and recent accepted diffs, and
+designs the roles itself: it writes a `roles.json`
+(`[{"role", "focus", "responsibility"}, ...]`) into a scratch directory, which
+is validated (name sanitizing, focus required, count capped, duplicates
+dropped) before use. Each generated focus and responsibility is injected into
+that trial's agent prompt.
+
+On any failure — adapter error, missing or malformed JSON — the generation
+falls back to the static catalog and the error is recorded in
+`agent_messages`, so a broken orchestrator never stalls the loop. An explicit
+`--roles` list always takes precedence and skips the orchestrator entirely.
+
+```bash
+python3 tools/ahc.py autopilot --problem ahc067 --seeds 0-99 \
+  --generations 8 --agents 3 --dynamic-roles --archive --repair-attempts 1
+```
+
 ## Evaluation performance
 
 Seed evaluation is parallel and cached:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import random
+import re
 import shlex
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -105,8 +106,14 @@ def build_agent_prompt(
     focus: str | None = None,
     recent_changes: str = "",
     archive_note: str = "",
+    responsibility: str | None = None,
 ) -> str:
-    responsibility = SPECIALISTS.get(agent_name) or REVIEWERS.get(agent_name) or "Improve the solver."
+    responsibility = (
+        responsibility
+        or SPECIALISTS.get(agent_name)
+        or REVIEWERS.get(agent_name)
+        or "Improve the solver."
+    )
     brief = make_ai_brief(ExperimentDB.default(root), run_id)
     problem_context = read_problem_context(root, problem)
     focus_section = focus.strip() if focus and focus.strip() else "(no explicit focus; infer one scoped improvement from the analysis)"
@@ -246,6 +253,103 @@ def _format_gate_numbers(comparison: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def build_orchestrator_prompt(
+    *,
+    root: Path,
+    problem: str,
+    run_id: int,
+    analysis: dict[str, Any],
+    knowledge_hits: list[dict[str, Any]],
+    agent_count: int,
+    focus: str | None = None,
+    recent_changes: str = "",
+) -> str:
+    """Prompt asking the adapter LLM to design this generation's trial roles."""
+    brief = make_ai_brief(ExperimentDB.default(root), run_id)
+    problem_context = read_problem_context(root, problem)
+    catalog = "\n".join(f"- {name}: {desc}" for name, desc in SPECIALISTS.items())
+    focus_line = focus.strip() if focus and focus.strip() else "(none)"
+    return f"""You are the Orchestrator of an autonomous AtCoder Heuristic Contest improvement lab.
+
+Task: design the specialist roles for the next generation of solver-improvement
+trials. Study the analysis below, decide which distinct improvement directions
+are most promising right now, and write them to a file named `roles.json` in
+your current working directory.
+
+Output format (a JSON array with at most {agent_count} entries):
+[
+  {{"role": "ShortCamelCaseName",
+    "focus": "one scoped, testable improvement hypothesis",
+    "responsibility": "one sentence describing what this specialist owns"}}
+]
+
+Rules:
+- Each role must target a different improvement direction; no near-duplicates.
+- Focus statements must be concrete and scoped to one change, grounded in the
+  analysis (bad seeds, timing, score distribution), not generic advice.
+- Role names may use letters, digits, and underscore only.
+- Write only `roles.json`; do not modify any solver source.
+
+Operator focus constraint (every role must stay compatible with it):
+{focus_line}
+
+Problem: {problem}
+
+Problem context:
+{problem_context}
+
+Current run brief:
+{brief}
+
+Structured analysis:
+{analysis}
+
+Relevant knowledge:
+{knowledge_hits}
+
+Recent accepted changes:
+{recent_changes or "(none yet)"}
+
+Example role catalog (for inspiration; reuse these or invent better ones):
+{catalog}
+"""
+
+
+def parse_roles_file(path: Path, limit: int) -> list[dict[str, str]]:
+    """Parse and sanitize the orchestrator's `roles.json`.
+
+    Role names are restricted to ``[A-Za-z0-9_]`` because they become part of
+    workspace and prompt file names. Entries without a usable role or focus
+    are dropped; raises ValueError when nothing valid remains, so the caller
+    can fall back to the static specialist catalog.
+    """
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(data, list):
+        raise ValueError("roles.json must be a JSON array")
+    specs: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for entry in data:
+        if not isinstance(entry, dict):
+            continue
+        role = re.sub(r"[^A-Za-z0-9_]", "", str(entry.get("role") or ""))[:40]
+        focus = str(entry.get("focus") or "").strip()[:2000]
+        if not role or not focus or role in seen:
+            continue
+        seen.add(role)
+        specs.append(
+            {
+                "role": role,
+                "focus": focus,
+                "responsibility": str(entry.get("responsibility") or "").strip()[:500],
+            }
+        )
+        if len(specs) >= max(1, limit):
+            break
+    if not specs:
+        raise ValueError("roles.json contained no valid role entries")
+    return specs
+
+
 def read_problem_context(root: Path, problem: str, limit: int = 12000) -> str:
     problem_dir = root / "problems" / problem
     parts: list[str] = []
@@ -290,6 +394,7 @@ class Autopilot:
         novelty_filter: bool = True,
         archive_parents: bool = False,
         archive_rng: random.Random | None = None,
+        dynamic_roles: bool = False,
     ) -> AutopilotResult:
         session_id = self.db.create_session(self.problem, budget_sec, agent_count)
         status = "aborted"
@@ -314,6 +419,7 @@ class Autopilot:
                 novelty_filter=novelty_filter,
                 archive_parents=archive_parents,
                 archive_rng=archive_rng,
+                dynamic_roles=dynamic_roles,
             )
             status = result.status
             return result
@@ -342,6 +448,7 @@ class Autopilot:
         novelty_filter: bool,
         archive_parents: bool,
         archive_rng: random.Random | None,
+        dynamic_roles: bool,
     ) -> AutopilotResult:
         started = time.monotonic()
         seed_list = parse_seed_spec(seeds) or list(range(10))
@@ -369,10 +476,6 @@ class Autopilot:
             if budget_sec is not None and time.monotonic() - started > budget_sec:
                 break
             generations_run = generation
-            selected = roles or select_specialists(analysis, agent_count)
-            for agent in selected:
-                if agent not in all_selected:
-                    all_selected.append(agent)
             knowledge_hits = search_knowledge(
                 self.root,
                 " ".join(
@@ -387,16 +490,34 @@ class Autopilot:
                 limit=6,
             )
             recent_changes = self._recent_accepted_diffs()
+            trial_specs = self._select_trial_specs(
+                session_id=session_id,
+                generation=generation,
+                adapter_command=adapter_command,
+                dynamic_roles=dynamic_roles,
+                roles=roles,
+                analysis=analysis,
+                knowledge_hits=knowledge_hits,
+                recent_changes=recent_changes,
+                agent_count=agent_count,
+                focus=focus,
+                baseline_run_id=baseline_run_id,
+                prompt_dir=prompt_dir,
+            )
+            for spec in trial_specs:
+                if spec["role"] not in all_selected:
+                    all_selected.append(spec["role"])
             parents: list[ArchiveEntry] = []
             if archive_parents and adapter_command:
                 session_archive = build_archive(
                     self.db, self.problem, f"autopilot_s{session_id}_"
                 )
                 parents = sample_parents(
-                    session_archive, min(len(selected), max_trials), rng=archive_rng
+                    session_archive, min(len(trial_specs), max_trials), rng=archive_rng
                 )
             trials: list[dict[str, Any]] = []
-            for idx, agent_name in enumerate(selected[:max_trials], start=1):
+            for idx, spec in enumerate(trial_specs[:max_trials], start=1):
+                agent_name = spec["role"]
                 candidate_name = f"g{generation}_candidate_{idx}_{agent_name}"
                 trial_id = self.db.create_trial(
                     session_id=session_id,
@@ -441,9 +562,10 @@ class Autopilot:
                     run_id=prompt_run_id,
                     analysis=prompt_analysis,
                     knowledge_hits=knowledge_hits,
-                    focus=focus,
+                    focus=spec["focus"] or focus,
                     recent_changes=recent_changes,
                     archive_note=archive_note,
+                    responsibility=spec["responsibility"],
                 )
                 prompt_path = prompt_dir / f"{candidate_name}.md"
                 prompt_path.write_text(prompt, encoding="utf-8")
@@ -566,6 +688,102 @@ class Autopilot:
             merged_count=merged_count,
             generations_run=generations_run,
         )
+
+    def _select_trial_specs(
+        self,
+        *,
+        session_id: int,
+        generation: int,
+        adapter_command: str | None,
+        dynamic_roles: bool,
+        roles: list[str] | None,
+        analysis: dict[str, Any],
+        knowledge_hits: list[dict[str, Any]],
+        recent_changes: str,
+        agent_count: int,
+        focus: str | None,
+        baseline_run_id: int,
+        prompt_dir: Path,
+    ) -> list[dict[str, Any]]:
+        """Pick this generation's trial roles: explicit > generated > catalog.
+
+        A spec is {"role", "focus", "responsibility"}; focus/responsibility are
+        None for catalog roles so the operator's global focus applies.
+        """
+        if roles:
+            return [{"role": role, "focus": None, "responsibility": None} for role in roles]
+        if dynamic_roles and adapter_command:
+            generated = self._generate_roles(
+                session_id=session_id,
+                generation=generation,
+                adapter_command=adapter_command,
+                analysis=analysis,
+                knowledge_hits=knowledge_hits,
+                recent_changes=recent_changes,
+                agent_count=agent_count,
+                focus=focus,
+                baseline_run_id=baseline_run_id,
+                prompt_dir=prompt_dir,
+            )
+            if generated:
+                return [
+                    {
+                        "role": spec["role"],
+                        "focus": spec["focus"],
+                        "responsibility": spec["responsibility"] or None,
+                    }
+                    for spec in generated
+                ]
+        return [
+            {"role": role, "focus": None, "responsibility": None}
+            for role in select_specialists(analysis, agent_count)
+        ]
+
+    def _generate_roles(
+        self,
+        *,
+        session_id: int,
+        generation: int,
+        adapter_command: str,
+        analysis: dict[str, Any],
+        knowledge_hits: list[dict[str, Any]],
+        recent_changes: str,
+        agent_count: int,
+        focus: str | None,
+        baseline_run_id: int,
+        prompt_dir: Path,
+    ) -> list[dict[str, str]] | None:
+        """Ask the adapter LLM to design roles; None means fall back to the catalog."""
+        scratch = prompt_dir.parent / "orchestrator" / f"g{generation}"
+        scratch.mkdir(parents=True, exist_ok=True)
+        prompt = build_orchestrator_prompt(
+            root=self.root,
+            problem=self.problem,
+            run_id=baseline_run_id,
+            analysis=analysis,
+            knowledge_hits=knowledge_hits,
+            agent_count=agent_count,
+            focus=focus,
+            recent_changes=recent_changes,
+        )
+        prompt_path = scratch / "orchestrator_prompt.md"
+        prompt_path.write_text(prompt, encoding="utf-8")
+        self.db.record_agent_message(session_id, "Orchestrator", "prompt", prompt)
+        try:
+            self._run_adapter(
+                adapter_command,
+                prompt_path,
+                scratch,
+                log_stem=f"orchestrator_s{session_id}_g{generation}",
+            )
+            specs = parse_roles_file(scratch / "roles.json", agent_count)
+        except Exception as exc:
+            self.db.record_agent_message(session_id, "Orchestrator", "error", str(exc))
+            return None
+        self.db.record_agent_message(
+            session_id, "Orchestrator", "roles", json.dumps(specs, ensure_ascii=False)
+        )
+        return specs
 
     def _execute_trial(
         self,
@@ -956,6 +1174,7 @@ class Autopilot:
         cwd: Path,
         trial_id: int | None = None,
         log_suffix: str = "",
+        log_stem: str | None = None,
     ) -> None:
         rendered = command.format(prompt=shlex.quote(str(prompt_path)), cwd=shlex.quote(str(cwd)))
         env_cmd = os.path.expandvars(rendered)
@@ -963,7 +1182,12 @@ class Autopilot:
         result = run_shell(env_cmd, cwd, timeout=timeout)
         log_dir = self.root / "experiments" / "adapter_logs"
         log_dir.mkdir(parents=True, exist_ok=True)
-        stem = f"trial_{trial_id}{log_suffix}" if trial_id is not None else str(int(time.time()))
+        if log_stem is not None:
+            stem = log_stem
+        elif trial_id is not None:
+            stem = f"trial_{trial_id}{log_suffix}"
+        else:
+            stem = str(int(time.time()))
         (log_dir / f"{stem}.stdout.txt").write_text(result.stdout, encoding="utf-8")
         (log_dir / f"{stem}.stderr.txt").write_text(result.stderr, encoding="utf-8")
         if result.returncode != 0:

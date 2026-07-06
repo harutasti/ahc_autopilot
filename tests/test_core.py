@@ -12,7 +12,13 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from ahc_lab.agents import Autopilot, build_agent_prompt, select_specialists
+from ahc_lab.agents import (
+    SPECIALISTS,
+    Autopilot,
+    build_agent_prompt,
+    parse_roles_file,
+    select_specialists,
+)
 from ahc_lab.analysis import analyze_run, compare_runs
 from ahc_lab.archive import build_archive, sample_parents
 from ahc_lab.cli import _init_problem, _parse_roles
@@ -988,6 +994,125 @@ else:
                 encoding="utf-8"
             )
             self.assertIn(f"archive parent run {seeded_run}", prompt)
+
+
+class DynamicRolesTest(unittest.TestCase):
+    def test_parse_roles_file_validates_and_sanitizes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_s:
+            path = Path(tmp_s) / "roles.json"
+            path.write_text(
+                json.dumps(
+                    [
+                        {"role": "Beam Search!", "focus": "widen the beam"},
+                        {"role": "BeamSearch", "focus": "duplicate after sanitize"},
+                        {"role": "NoFocus"},
+                        {"role": "", "focus": "no role name"},
+                        "not a dict",
+                        {"role": "Tuner", "focus": "tune params", "responsibility": "owns params"},
+                        {"role": "OneTooMany", "focus": "over the limit"},
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            specs = parse_roles_file(path, limit=2)
+            self.assertEqual(
+                specs,
+                [
+                    {"role": "BeamSearch", "focus": "widen the beam", "responsibility": ""},
+                    {"role": "Tuner", "focus": "tune params", "responsibility": "owns params"},
+                ],
+            )
+            path.write_text(json.dumps({"not": "a list"}), encoding="utf-8")
+            with self.assertRaises(ValueError):
+                parse_roles_file(path, limit=2)
+            path.write_text(json.dumps([{"role": "X"}]), encoding="utf-8")
+            with self.assertRaises(ValueError):
+                parse_roles_file(path, limit=2)
+
+    def _run(self, tmp: Path, adapter_body: str, **kwargs):
+        tmp = _make_dummy_root(tmp, ECHO_MINUS_TEN_SOLVER)
+        adapter = tmp / "adapter.py"
+        adapter.write_text(adapter_body, encoding="utf-8")
+        db = ExperimentDB.default(tmp)
+        result = Autopilot(tmp, "dummy", db).run(
+            budget_sec=None,
+            max_trials=1,
+            agent_count=1,
+            seeds="0-2",
+            adapter_command=f"{sys.executable} {adapter} {{cwd}} {{prompt}}",
+            dynamic_roles=True,
+            **kwargs,
+        )
+        trial = db.conn.execute(
+            "select * from autopilot_trials where session_id = ?", (result.session_id,)
+        ).fetchone()
+        return db, result, trial
+
+    def test_dynamic_roles_generates_trials_from_orchestrator(self) -> None:
+        adapter_body = f"""import json, pathlib, sys
+cwd = pathlib.Path(sys.argv[1])
+prompt = pathlib.Path(sys.argv[2]).read_text(encoding="utf-8")
+if "roles.json" in prompt:
+    (cwd / "roles.json").write_text(json.dumps([
+        {{"role": "Offset Tuner!", "focus": "tune the output offset constant",
+          "responsibility": "owns the output offset constant"}}
+    ]), encoding="utf-8")
+else:
+    (cwd / "solver" / "main.cpp").write_text({ECHO_SOLVER!r}, encoding="utf-8")
+"""
+        with tempfile.TemporaryDirectory() as tmp_s:
+            tmp = Path(tmp_s)
+            db, result, trial = self._run(tmp, adapter_body, roles=None)
+            self.assertEqual(trial["role"], "OffsetTuner")
+            self.assertEqual(trial["decision"], "accepted")
+            self.assertEqual(result.selected_agents, ["OffsetTuner"])
+            self.assertEqual(result.merged_count, 1)
+            prompt = (result.prompt_dir / "g1_candidate_1_OffsetTuner.md").read_text(
+                encoding="utf-8"
+            )
+            self.assertIn("tune the output offset constant", prompt)
+            self.assertIn("owns the output offset constant", prompt)
+            roles_message = db.conn.execute(
+                "select content from agent_messages where agent_name = 'Orchestrator'"
+                " and role = 'roles'"
+            ).fetchone()
+            self.assertIsNotNone(roles_message)
+            self.assertIn("OffsetTuner", roles_message["content"])
+
+    def test_dynamic_roles_falls_back_on_invalid_output(self) -> None:
+        adapter_body = f"""import json, pathlib, sys
+cwd = pathlib.Path(sys.argv[1])
+prompt = pathlib.Path(sys.argv[2]).read_text(encoding="utf-8")
+if "roles.json" in prompt:
+    (cwd / "roles.json").write_text(json.dumps({{"not": "a list"}}), encoding="utf-8")
+else:
+    (cwd / "solver" / "main.cpp").write_text({ECHO_SOLVER!r}, encoding="utf-8")
+"""
+        with tempfile.TemporaryDirectory() as tmp_s:
+            tmp = Path(tmp_s)
+            db, result, trial = self._run(tmp, adapter_body, roles=None)
+            self.assertIn(trial["role"], SPECIALISTS)  # static catalog fallback
+            self.assertEqual(trial["decision"], "accepted")
+            error_message = db.conn.execute(
+                "select content from agent_messages where agent_name = 'Orchestrator'"
+                " and role = 'error'"
+            ).fetchone()
+            self.assertIsNotNone(error_message)
+            self.assertIn("JSON array", error_message["content"])
+
+    def test_explicit_roles_bypass_orchestrator(self) -> None:
+        adapter_body = f"""import pathlib, sys
+cwd = pathlib.Path(sys.argv[1])
+prompt = pathlib.Path(sys.argv[2]).read_text(encoding="utf-8")
+assert "roles.json" not in prompt, "orchestrator must not run when --roles is given"
+(cwd / "solver" / "main.cpp").write_text({ECHO_SOLVER!r}, encoding="utf-8")
+"""
+        with tempfile.TemporaryDirectory() as tmp_s:
+            tmp = Path(tmp_s)
+            db, result, trial = self._run(tmp, adapter_body, roles=["StateDesignBuilder"])
+            self.assertEqual(trial["role"], "StateDesignBuilder")
+            self.assertEqual(trial["decision"], "accepted")
+            self.assertFalse((result.prompt_dir.parent / "orchestrator").exists())
 
 
 class AcceptanceGateTest(unittest.TestCase):

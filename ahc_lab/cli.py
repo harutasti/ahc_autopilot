@@ -124,6 +124,15 @@ def main(argv: list[str] | None = None) -> int:
             "(weighted by fitness and novelty) instead of always branching from the mainline"
         ),
     )
+    p.add_argument(
+        "--dynamic-roles",
+        action="store_true",
+        help=(
+            "let an orchestrator LLM (via the adapter) design each generation's roles and "
+            "focus from the analysis; falls back to the static catalog on failure. "
+            "--roles takes precedence"
+        ),
+    )
 
     p = sub.add_parser("source")
     p.add_argument("--run", type=int, required=True)
@@ -211,6 +220,7 @@ def main(argv: list[str] | None = None) -> int:
             repair_attempts=args.repair_attempts,
             novelty_filter=not args.no_novelty_filter,
             archive_parents=args.archive,
+            dynamic_roles=args.dynamic_roles,
         )
         print(json.dumps({
             "session_id": result.session_id,
