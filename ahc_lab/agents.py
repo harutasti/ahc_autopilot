@@ -3,13 +3,14 @@ from __future__ import annotations
 import os
 import shlex
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from .analysis import analyze_run, compare_runs, make_ai_brief, write_analysis_markdown
 from .db import ExperimentDB
-from .evaluator import Evaluator
+from .evaluator import Evaluator, default_jobs
 from .knowledge import search_knowledge
 from .policy import AcceptancePolicy, evaluate_acceptance
 from .runner import run_shell
@@ -45,18 +46,38 @@ class AutopilotResult:
     status: str
     final_baseline_run_id: int
     merged_count: int
+    generations_run: int
+
+
+@dataclass
+class TrialOutcome:
+    trial_id: int
+    agent_name: str
+    candidate_name: str
+    workspace_path: str
+    decision: str
+    candidate_run_id: int | None = None
+    mean_effective_delta: float = 0.0
+    summary: dict[str, Any] | None = None
 
 
 def select_specialists(analysis: dict[str, Any], agent_count: int) -> list[str]:
-    selected = ["ProblemAnalyst"]
+    """Pick builder roles for implementation trials from the latest analysis.
+
+    Analysis-only roles such as ProblemAnalyst are excluded: they produce no
+    candidate source, so giving them a trial slot wastes an evaluation. Use
+    `--roles` to request them explicitly.
+    """
+    selected: list[str] = []
     mean_elapsed = analysis.get("mean_elapsed_sec") or 0.0
     status_counts = analysis.get("status_counts") or {}
-    low_score_cases = analysis.get("bad_seeds") or []
-    if low_score_cases:
+    if analysis.get("bad_seeds"):
         selected.append("CutBuilder")
     if status_counts.get("timeout", 0) or mean_elapsed > 1.0:
         selected.append("PerformanceBuilder")
-    selected.extend(["AnnealingBuilder", "StateDesignBuilder", "ParameterTuner"])
+    selected.extend(
+        ["AnnealingBuilder", "StateDesignBuilder", "GreedyConstructiveBuilder", "ParameterTuner"]
+    )
     ordered: list[str] = []
     for agent in selected:
         if agent not in ordered:
@@ -150,6 +171,9 @@ class Autopilot:
         jobs: int | None = None,
         use_cache: bool = True,
         cascade: bool = True,
+        generations: int = 1,
+        validation_seeds: str | None = None,
+        trial_jobs: int | None = None,
     ) -> AutopilotResult:
         session_id = self.db.create_session(self.problem, budget_sec, agent_count)
         status = "aborted"
@@ -167,6 +191,9 @@ class Autopilot:
                 jobs=jobs,
                 use_cache=use_cache,
                 cascade=cascade,
+                generations=generations,
+                validation_seeds=validation_seeds,
+                trial_jobs=trial_jobs,
             )
             status = result.status
             return result
@@ -188,9 +215,13 @@ class Autopilot:
         jobs: int | None,
         use_cache: bool,
         cascade: bool,
+        generations: int,
+        validation_seeds: str | None,
+        trial_jobs: int | None,
     ) -> AutopilotResult:
         started = time.monotonic()
         seed_list = parse_seed_spec(seeds) or list(range(10))
+        validation_list = parse_seed_spec(validation_seeds) if validation_seeds else []
         evaluator = Evaluator(self.root, self.problem, self.db)
         policy = AcceptancePolicy.from_config(evaluator.config)
         baseline_run_id = evaluator.evaluate(
@@ -202,125 +233,294 @@ class Autopilot:
         )
         initial_baseline_run_id = baseline_run_id
         merged_count = 0
+        generations_run = 0
         analysis = analyze_run(self.db, baseline_run_id)
         prompt_dir = self.root / "experiments" / "autopilot" / f"session_{session_id}" / "prompts"
         prompt_dir.mkdir(parents=True, exist_ok=True)
         write_analysis_markdown(
             prompt_dir.parent / "baseline_analysis.md", "Baseline Analysis", analysis
         )
-        selected = roles or select_specialists(analysis, agent_count)
-        knowledge_hits = search_knowledge(
-            self.root,
-            " ".join(
-                part
-                for part in [
-                    self.problem,
-                    "annealing beam greedy state performance parameter graph cut separator bottleneck",
-                    focus or "",
-                ]
-                if part
-            ),
-            limit=6,
-        )
-        for idx, agent_name in enumerate(selected[:max_trials], start=1):
+        all_selected: list[str] = []
+        for generation in range(1, max(1, generations) + 1):
             if budget_sec is not None and time.monotonic() - started > budget_sec:
                 break
-            candidate_name = f"candidate_{idx}_{agent_name}"
-            trial_id = self.db.create_trial(
-                session_id=session_id,
-                role=agent_name,
-                candidate_name=candidate_name,
-                base_run_id=baseline_run_id,
+            generations_run = generation
+            selected = roles or select_specialists(analysis, agent_count)
+            for agent in selected:
+                if agent not in all_selected:
+                    all_selected.append(agent)
+            knowledge_hits = search_knowledge(
+                self.root,
+                " ".join(
+                    part
+                    for part in [
+                        self.problem,
+                        "annealing beam greedy state performance parameter graph cut separator bottleneck",
+                        focus or "",
+                    ]
+                    if part
+                ),
+                limit=6,
             )
-            workspace = create_candidate_workspace(
-                self.root, session_id=session_id, candidate_name=candidate_name
-            )
-            prompt = build_agent_prompt(
-                root=self.root,
-                problem=self.problem,
-                agent_name=agent_name,
-                run_id=baseline_run_id,
-                analysis=analysis,
-                knowledge_hits=knowledge_hits,
-                focus=focus,
-            )
-            prompt_path = prompt_dir / f"{candidate_name}.md"
-            prompt_path.write_text(prompt, encoding="utf-8")
-            self.db.record_agent_message(session_id, agent_name, "prompt", prompt)
-            if adapter_command:
-                candidate_root = Path(workspace["path"])
-                try:
-                    self._run_adapter(adapter_command, prompt_path, candidate_root)
-                    candidate_evaluator = Evaluator(candidate_root, self.problem, self.db)
-                    candidate_tag = f"autopilot_s{session_id}_{candidate_name}"
-                    cascade_info: dict[str, Any] | None = None
-                    if cascade:
-                        candidate_run_id, cascade_info = candidate_evaluator.evaluate_cascade(
-                            seed_list,
-                            tag=candidate_tag,
-                            baseline_run_id=baseline_run_id,
-                            policy=policy,
-                            run_type="candidate",
-                            jobs=jobs,
-                            use_cache=use_cache,
-                        )
-                    else:
-                        candidate_run_id = candidate_evaluator.evaluate(
-                            seed_list,
-                            tag=candidate_tag,
-                            run_type="candidate",
-                            jobs=jobs,
-                            use_cache=use_cache,
-                        )
-                    comparison = compare_runs(self.db, baseline_run_id, candidate_run_id)
-                    verdict = evaluate_acceptance(comparison, policy)
-                    decision = verdict["decision"]
-                    if decision != "neutral":
-                        self.db.update_scorecard(
-                            agent_name,
-                            decision == "accepted",
-                            float(comparison.get("mean_effective_delta") or 0.0),
-                        )
-                    summary: dict[str, Any] = {**comparison, "acceptance": verdict}
-                    if cascade_info is not None:
-                        summary["cascade"] = cascade_info
-                    if decision == "accepted" and merge_accepted:
-                        summary["merged_source_hash"] = self._merge_candidate(
-                            trial_id, candidate_name, candidate_run_id
-                        )
-                        baseline_run_id = candidate_run_id
-                        analysis = analyze_run(self.db, baseline_run_id)
-                        merged_count += 1
-                    self.db.finish_trial(
-                        trial_id,
-                        status="evaluated",
-                        decision=decision,
-                        new_run_id=candidate_run_id,
-                        summary=summary,
-                    )
-                except Exception as exc:
-                    self.db.finish_trial(
-                        trial_id,
-                        status="failed",
-                        decision="error",
-                        summary={"error": str(exc)},
-                    )
-            else:
-                self.db.finish_trial(
-                    trial_id,
-                    status="prompt_only",
-                    decision="pending_adapter",
-                    summary={"prompt_path": str(prompt_path), "workspace": workspace["path"]},
+            trials: list[dict[str, Any]] = []
+            for idx, agent_name in enumerate(selected[:max_trials], start=1):
+                candidate_name = f"g{generation}_candidate_{idx}_{agent_name}"
+                trial_id = self.db.create_trial(
+                    session_id=session_id,
+                    role=agent_name,
+                    candidate_name=candidate_name,
+                    base_run_id=baseline_run_id,
                 )
+                workspace = create_candidate_workspace(
+                    self.root, session_id=session_id, candidate_name=candidate_name
+                )
+                prompt = build_agent_prompt(
+                    root=self.root,
+                    problem=self.problem,
+                    agent_name=agent_name,
+                    run_id=baseline_run_id,
+                    analysis=analysis,
+                    knowledge_hits=knowledge_hits,
+                    focus=focus,
+                )
+                prompt_path = prompt_dir / f"{candidate_name}.md"
+                prompt_path.write_text(prompt, encoding="utf-8")
+                self.db.record_agent_message(session_id, agent_name, "prompt", prompt)
+                trials.append(
+                    {
+                        "trial_id": trial_id,
+                        "agent_name": agent_name,
+                        "candidate_name": candidate_name,
+                        "workspace_path": workspace["path"],
+                        "prompt_path": prompt_path,
+                    }
+                )
+            if not adapter_command:
+                for trial in trials:
+                    self.db.finish_trial(
+                        trial["trial_id"],
+                        status="prompt_only",
+                        decision="pending_adapter",
+                        summary={
+                            "prompt_path": str(trial["prompt_path"]),
+                            "workspace": trial["workspace_path"],
+                        },
+                    )
+                break
+            per_trial_jobs = (
+                jobs if jobs is not None else max(1, default_jobs() // max(1, len(trials)))
+            )
+            outcomes: list[TrialOutcome] = []
+            with ThreadPoolExecutor(max_workers=max(1, trial_jobs or len(trials))) as pool:
+                futures = [
+                    pool.submit(
+                        self._execute_trial,
+                        adapter_command=adapter_command,
+                        baseline_run_id=baseline_run_id,
+                        seed_list=seed_list,
+                        policy=policy,
+                        jobs=per_trial_jobs,
+                        use_cache=use_cache,
+                        cascade=cascade,
+                        session_id=session_id,
+                        **trial,
+                    )
+                    for trial in trials
+                ]
+                for future in as_completed(futures):
+                    outcomes.append(future.result())
+            accepted = sorted(
+                [o for o in outcomes if o.decision == "accepted"],
+                key=lambda o: o.mean_effective_delta,
+                reverse=True,
+            )
+            merged_this_generation = False
+            for outcome in accepted:
+                if not merge_accepted or merged_this_generation:
+                    self.db.update_scorecard(outcome.agent_name, True, outcome.mean_effective_delta)
+                    continue
+                if validation_list:
+                    passed, validation = self._validate_candidate(
+                        outcome,
+                        validation_list,
+                        policy,
+                        session_id,
+                        generation,
+                        jobs=per_trial_jobs,
+                        use_cache=use_cache,
+                    )
+                    if not passed:
+                        self.db.update_scorecard(
+                            outcome.agent_name, False, outcome.mean_effective_delta
+                        )
+                        self.db.finish_trial(
+                            outcome.trial_id,
+                            status="evaluated",
+                            decision="validation_failed",
+                            new_run_id=outcome.candidate_run_id,
+                            summary={**(outcome.summary or {}), "validation": validation},
+                        )
+                        continue
+                    outcome.summary = {**(outcome.summary or {}), "validation": validation}
+                merged_hash = self._merge_candidate(
+                    outcome.trial_id, outcome.candidate_name, outcome.candidate_run_id
+                )
+                self.db.update_scorecard(outcome.agent_name, True, outcome.mean_effective_delta)
+                self.db.finish_trial(
+                    outcome.trial_id,
+                    status="evaluated",
+                    decision="accepted",
+                    new_run_id=outcome.candidate_run_id,
+                    summary={**(outcome.summary or {}), "merged_source_hash": merged_hash},
+                )
+                baseline_run_id = outcome.candidate_run_id
+                analysis = analyze_run(self.db, baseline_run_id)
+                merged_count += 1
+                merged_this_generation = True
+            if not merge_accepted:
+                break
+            if not merged_this_generation:
+                break
         return AutopilotResult(
             session_id=session_id,
             baseline_run_id=initial_baseline_run_id,
             prompt_dir=prompt_dir,
-            selected_agents=selected,
+            selected_agents=all_selected,
             status="completed" if adapter_command else "prompts_generated",
             final_baseline_run_id=baseline_run_id,
             merged_count=merged_count,
+            generations_run=generations_run,
         )
+
+    def _execute_trial(
+        self,
+        *,
+        trial_id: int,
+        agent_name: str,
+        candidate_name: str,
+        workspace_path: str,
+        prompt_path: Path,
+        adapter_command: str,
+        baseline_run_id: int,
+        seed_list: list[int],
+        policy: AcceptancePolicy,
+        jobs: int,
+        use_cache: bool,
+        cascade: bool,
+        session_id: int,
+    ) -> TrialOutcome:
+        """Run one trial in a worker thread with its own DB connection."""
+        db = ExperimentDB(self.db.path)
+        candidate_root = Path(workspace_path)
+        try:
+            try:
+                self._run_adapter(adapter_command, prompt_path, candidate_root, trial_id=trial_id)
+                candidate_evaluator = Evaluator(candidate_root, self.problem, db)
+                candidate_tag = f"autopilot_s{session_id}_{candidate_name}"
+                cascade_info: dict[str, Any] | None = None
+                if cascade:
+                    candidate_run_id, cascade_info = candidate_evaluator.evaluate_cascade(
+                        seed_list,
+                        tag=candidate_tag,
+                        baseline_run_id=baseline_run_id,
+                        policy=policy,
+                        run_type="candidate",
+                        jobs=jobs,
+                        use_cache=use_cache,
+                    )
+                else:
+                    candidate_run_id = candidate_evaluator.evaluate(
+                        seed_list,
+                        tag=candidate_tag,
+                        run_type="candidate",
+                        jobs=jobs,
+                        use_cache=use_cache,
+                    )
+                comparison = compare_runs(db, baseline_run_id, candidate_run_id)
+                verdict = evaluate_acceptance(comparison, policy)
+                decision = verdict["decision"]
+                mean_delta = float(comparison.get("mean_effective_delta") or 0.0)
+                if decision == "rejected":
+                    db.update_scorecard(agent_name, False, mean_delta)
+                summary: dict[str, Any] = {**comparison, "acceptance": verdict}
+                if cascade_info is not None:
+                    summary["cascade"] = cascade_info
+                db.finish_trial(
+                    trial_id,
+                    status="evaluated",
+                    decision=decision,
+                    new_run_id=candidate_run_id,
+                    summary=summary,
+                )
+                return TrialOutcome(
+                    trial_id=trial_id,
+                    agent_name=agent_name,
+                    candidate_name=candidate_name,
+                    workspace_path=workspace_path,
+                    decision=decision,
+                    candidate_run_id=candidate_run_id,
+                    mean_effective_delta=mean_delta,
+                    summary=summary,
+                )
+            except Exception as exc:
+                db.finish_trial(
+                    trial_id,
+                    status="failed",
+                    decision="error",
+                    summary={"error": str(exc)},
+                )
+                return TrialOutcome(
+                    trial_id=trial_id,
+                    agent_name=agent_name,
+                    candidate_name=candidate_name,
+                    workspace_path=workspace_path,
+                    decision="error",
+                    summary={"error": str(exc)},
+                )
+        finally:
+            db.close()
+
+    def _validate_candidate(
+        self,
+        outcome: TrialOutcome,
+        validation_list: list[int],
+        policy: AcceptancePolicy,
+        session_id: int,
+        generation: int,
+        *,
+        jobs: int | None,
+        use_cache: bool,
+    ) -> tuple[bool, dict[str, Any]]:
+        """Confirm an accepted candidate on held-out seeds before merging.
+
+        The candidate must not be rejected by the same gate on the validation
+        seeds; `neutral` passes, since validation is a non-regression check.
+        """
+        try:
+            baseline_val = Evaluator(self.root, self.problem, self.db).evaluate(
+                validation_list,
+                tag=f"autopilot_s{session_id}_g{generation}_validation_baseline",
+                run_type="validation",
+                jobs=jobs,
+                use_cache=use_cache,
+            )
+            candidate_val = Evaluator(Path(outcome.workspace_path), self.problem, self.db).evaluate(
+                validation_list,
+                tag=f"autopilot_s{session_id}_{outcome.candidate_name}_validation",
+                run_type="validation",
+                jobs=jobs,
+                use_cache=use_cache,
+            )
+            comparison = compare_runs(self.db, baseline_val, candidate_val)
+            verdict = evaluate_acceptance(comparison, policy)
+        except Exception as exc:
+            return False, {"error": str(exc)}
+        passed = verdict["decision"] != "rejected"
+        return passed, {
+            "baseline_run_id": baseline_val,
+            "candidate_run_id": candidate_val,
+            "acceptance": verdict,
+        }
 
     def _merge_candidate(self, trial_id: int, candidate_name: str, candidate_run_id: int) -> str:
         """Copy an accepted candidate's source back into the mainline solver."""
@@ -337,17 +537,19 @@ class Autopilot:
         )
         return source_hash
 
-    def _run_adapter(self, command: str, prompt_path: Path, cwd: Path) -> None:
+    def _run_adapter(
+        self, command: str, prompt_path: Path, cwd: Path, trial_id: int | None = None
+    ) -> None:
         rendered = command.format(prompt=shlex.quote(str(prompt_path)), cwd=shlex.quote(str(cwd)))
         env_cmd = os.path.expandvars(rendered)
         result = run_shell(env_cmd, cwd, timeout=600)
         log_dir = self.root / "experiments" / "adapter_logs"
         log_dir.mkdir(parents=True, exist_ok=True)
-        stamp = int(time.time())
-        (log_dir / f"{stamp}.stdout.txt").write_text(result.stdout, encoding="utf-8")
-        (log_dir / f"{stamp}.stderr.txt").write_text(result.stderr, encoding="utf-8")
+        stem = f"trial_{trial_id}" if trial_id is not None else str(int(time.time()))
+        (log_dir / f"{stem}.stdout.txt").write_text(result.stdout, encoding="utf-8")
+        (log_dir / f"{stem}.stderr.txt").write_text(result.stderr, encoding="utf-8")
         if result.returncode != 0:
             raise RuntimeError(
                 f"adapter failed with exit code {result.returncode}; "
-                f"see {log_dir / f'{stamp}.stderr.txt'}"
+                f"see {log_dir / f'{stem}.stderr.txt'}"
             )

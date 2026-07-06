@@ -139,6 +139,7 @@ class ExperimentDB:
         self.conn = sqlite3.connect(self.path)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("pragma journal_mode=wal")
+        self.conn.execute("pragma busy_timeout=10000")
         self.conn.executescript(SCHEMA)
         self._migrate()
         self.conn.commit()

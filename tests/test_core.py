@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import random
 import shutil
 import subprocess
 import sys
@@ -34,6 +35,27 @@ ECHO_SOLVER = """
 int main() {
     long long target;
     if (!(std::cin >> target)) return 0;
+    std::cout << target << '\\n';
+    return 0;
+}
+"""
+
+ECHO_MINUS_FIVE_SOLVER = """
+#include <iostream>
+int main() {
+    long long target;
+    if (!(std::cin >> target)) return 0;
+    std::cout << target - 5 << '\\n';
+    return 0;
+}
+"""
+
+CRASHY_LARGE_TARGET_SOLVER = """
+#include <iostream>
+int main() {
+    long long target;
+    if (!(std::cin >> target)) return 0;
+    if (target > 500000) return 1;
     std::cout << target << '\\n';
     return 0;
 }
@@ -247,16 +269,17 @@ target.write_text({ECHO_SOLVER!r}, encoding="utf-8")
         )
         return adapter
 
-    def _run_autopilot(self, tmp: Path, adapter: Path, *, merge_accepted: bool):
+    def _run_autopilot(self, tmp: Path, adapter: Path, *, merge_accepted: bool, **kwargs):
         db = ExperimentDB.default(tmp)
         result = Autopilot(tmp, "dummy", db).run(
             budget_sec=None,
-            max_trials=1,
-            agent_count=1,
-            seeds="0-2",
+            max_trials=kwargs.pop("max_trials", 1),
+            agent_count=kwargs.pop("agent_count", 1),
+            seeds=kwargs.pop("seeds", "0-2"),
             adapter_command=f"{sys.executable} {adapter} {{cwd}}",
-            roles=["AnnealingBuilder"],
+            roles=kwargs.pop("roles", ["AnnealingBuilder"]),
             merge_accepted=merge_accepted,
+            **kwargs,
         )
         return db, result
 
@@ -297,6 +320,121 @@ target.write_text({ECHO_SOLVER!r}, encoding="utf-8")
             self.assertEqual(result.final_baseline_run_id, result.baseline_run_id)
             untouched = (tmp / "solver" / "main.cpp").read_text(encoding="utf-8")
             self.assertEqual(untouched, ECHO_MINUS_TEN_SOLVER)
+
+
+class AutopilotGenerationTest(unittest.TestCase):
+    def test_generation_loop_improves_until_stagnation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_s:
+            tmp = _make_dummy_root(Path(tmp_s), ECHO_MINUS_TEN_SOLVER)
+            adapter = tmp / "adapter.py"
+            adapter.write_text(
+                f"""import pathlib, sys
+p = pathlib.Path(sys.argv[1]) / "solver" / "main.cpp"
+text = p.read_text(encoding="utf-8")
+if "target - 10" in text:
+    p.write_text({ECHO_MINUS_FIVE_SOLVER!r}, encoding="utf-8")
+elif "target - 5" in text:
+    p.write_text({ECHO_SOLVER!r}, encoding="utf-8")
+""",
+                encoding="utf-8",
+            )
+            db = ExperimentDB.default(tmp)
+            result = Autopilot(tmp, "dummy", db).run(
+                budget_sec=None,
+                max_trials=1,
+                agent_count=1,
+                seeds="0-2",
+                adapter_command=f"{sys.executable} {adapter} {{cwd}}",
+                roles=["AnnealingBuilder"],
+                generations=5,
+            )
+            self.assertEqual(result.merged_count, 2)
+            self.assertEqual(result.generations_run, 3)
+            self.assertEqual(
+                (tmp / "solver" / "main.cpp").read_text(encoding="utf-8"), ECHO_SOLVER
+            )
+            self.assertNotEqual(result.final_baseline_run_id, result.baseline_run_id)
+            decisions = [
+                row["decision"]
+                for row in db.conn.execute(
+                    "select decision from autopilot_trials where session_id = ? order by id",
+                    (result.session_id,),
+                )
+            ]
+            self.assertEqual(decisions, ["accepted", "accepted", "neutral"])
+
+    def test_parallel_trials_merge_best_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_s:
+            tmp = _make_dummy_root(Path(tmp_s), ECHO_MINUS_TEN_SOLVER)
+            adapter = tmp / "adapter.py"
+            adapter.write_text(
+                f"""import pathlib, sys
+p = pathlib.Path(sys.argv[1]) / "solver" / "main.cpp"
+p.write_text({ECHO_SOLVER!r}, encoding="utf-8")
+""",
+                encoding="utf-8",
+            )
+            db = ExperimentDB.default(tmp)
+            result = Autopilot(tmp, "dummy", db).run(
+                budget_sec=None,
+                max_trials=2,
+                agent_count=2,
+                seeds="0-2",
+                adapter_command=f"{sys.executable} {adapter} {{cwd}}",
+                roles=["AnnealingBuilder", "StateDesignBuilder"],
+            )
+            decisions = [
+                row["decision"]
+                for row in db.conn.execute(
+                    "select decision from autopilot_trials where session_id = ?",
+                    (result.session_id,),
+                )
+            ]
+            self.assertEqual(sorted(decisions), ["accepted", "accepted"])
+            self.assertEqual(result.merged_count, 1)
+            merges = db.conn.execute(
+                "select count(*) as n from patches where status = 'merged'"
+            ).fetchone()["n"]
+            self.assertEqual(merges, 1)
+            self.assertEqual(
+                (tmp / "solver" / "main.cpp").read_text(encoding="utf-8"), ECHO_SOLVER
+            )
+
+    def test_validation_gate_blocks_candidate(self) -> None:
+        targets = {s: random.Random(s).randint(0, 1_000_000) for s in range(60)}
+        eval_seeds = [s for s in range(60) if targets[s] <= 400_000][:3]
+        val_seeds = [s for s in range(60) if targets[s] >= 600_000][:2]
+        self.assertEqual(len(eval_seeds), 3)
+        self.assertEqual(len(val_seeds), 2)
+        with tempfile.TemporaryDirectory() as tmp_s:
+            tmp = _make_dummy_root(Path(tmp_s), ECHO_MINUS_TEN_SOLVER)
+            adapter = tmp / "adapter.py"
+            adapter.write_text(
+                f"""import pathlib, sys
+p = pathlib.Path(sys.argv[1]) / "solver" / "main.cpp"
+p.write_text({CRASHY_LARGE_TARGET_SOLVER!r}, encoding="utf-8")
+""",
+                encoding="utf-8",
+            )
+            db = ExperimentDB.default(tmp)
+            result = Autopilot(tmp, "dummy", db).run(
+                budget_sec=None,
+                max_trials=1,
+                agent_count=1,
+                seeds=",".join(str(s) for s in eval_seeds),
+                validation_seeds=",".join(str(s) for s in val_seeds),
+                adapter_command=f"{sys.executable} {adapter} {{cwd}}",
+                roles=["AnnealingBuilder"],
+            )
+            trial = db.conn.execute(
+                "select * from autopilot_trials where session_id = ?", (result.session_id,)
+            ).fetchone()
+            self.assertEqual(trial["decision"], "validation_failed")
+            self.assertEqual(result.merged_count, 0)
+            self.assertEqual(
+                (tmp / "solver" / "main.cpp").read_text(encoding="utf-8"),
+                ECHO_MINUS_TEN_SOLVER,
+            )
 
 
 class AcceptanceGateTest(unittest.TestCase):
@@ -397,6 +535,32 @@ class AcceptanceGateTest(unittest.TestCase):
         self.assertEqual(evaluate_acceptance(comparison, budget)["decision"], "accepted")
         tight = AcceptancePolicy(max_worsening_seeds=1, max_worsening_delta=10.0)
         self.assertEqual(evaluate_acceptance(comparison, tight)["decision"], "rejected")
+
+    def test_improve_confidence_reported_and_gated(self) -> None:
+        all_wins = self._compare(
+            [{"seed": s, "score": 100} for s in range(3)],
+            [{"seed": s, "score": 110} for s in range(3)],
+        )
+        self.assertEqual(all_wins["improve_confidence"], 1.0)
+        confident = AcceptancePolicy(min_improve_confidence=0.9)
+        self.assertEqual(evaluate_acceptance(all_wins, confident)["decision"], "accepted")
+        mixed = self._compare(
+            [{"seed": s, "score": 100} for s in range(4)],
+            [
+                {"seed": 0, "score": 110},
+                {"seed": 1, "score": 110},
+                {"seed": 2, "score": 91},
+                {"seed": 3, "score": 91},
+            ],
+        )
+        lenient = AcceptancePolicy(max_worsening_seeds=2, max_worsening_delta=100.0)
+        self.assertEqual(evaluate_acceptance(mixed, lenient)["decision"], "accepted")
+        strict = AcceptancePolicy(
+            max_worsening_seeds=2, max_worsening_delta=100.0, min_improve_confidence=0.9
+        )
+        verdict = evaluate_acceptance(mixed, strict)
+        self.assertEqual(verdict["decision"], "rejected")
+        self.assertTrue(any("confidence" in reason for reason in verdict["reasons"]))
 
     def test_elapsed_over_limit_rejected(self) -> None:
         comparison = self._compare(

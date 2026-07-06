@@ -82,6 +82,23 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="evaluate candidates on all seeds instead of staged evaluation with early pruning",
     )
+    p.add_argument(
+        "--generations",
+        type=int,
+        default=1,
+        help="improvement generations; each merges its best accepted candidate before the next (stops early on stagnation)",
+    )
+    p.add_argument(
+        "--validation-seeds",
+        default=None,
+        help="held-out seed spec; accepted candidates must also pass the gate here before merging",
+    )
+    p.add_argument(
+        "--trial-jobs",
+        type=int,
+        default=None,
+        help="how many trials run concurrently per generation (default: all)",
+    )
 
     p = sub.add_parser("source")
     p.add_argument("--run", type=int, required=True)
@@ -163,6 +180,9 @@ def main(argv: list[str] | None = None) -> int:
             jobs=args.jobs,
             use_cache=not args.no_cache,
             cascade=not args.no_cascade,
+            generations=args.generations,
+            validation_seeds=args.validation_seeds,
+            trial_jobs=args.trial_jobs,
         )
         print(json.dumps({
             "session_id": result.session_id,
@@ -172,6 +192,7 @@ def main(argv: list[str] | None = None) -> int:
             "status": result.status,
             "final_baseline_run_id": result.final_baseline_run_id,
             "merged_count": result.merged_count,
+            "generations_run": result.generations_run,
         }, indent=2))
         return 0
     if args.cmd == "source":
@@ -274,6 +295,7 @@ score_regex: SCORE:\\s*([-+0-9.eE]+)
 #   max_worsening_delta: 0
 #   max_elapsed_sec: 1.9
 #   neutral_speedup_ratio: 0.05
+#   min_improve_confidence: 0.9
 """
 
 

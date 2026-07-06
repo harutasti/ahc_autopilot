@@ -1,11 +1,34 @@
 from __future__ import annotations
 
 import json
+import random
 import statistics
 from pathlib import Path
 from typing import Any
 
 from .db import ExperimentDB
+
+
+def _improve_confidence(
+    deltas: list[float], iterations: int = 1000, seed: int = 0
+) -> float | None:
+    """Paired bootstrap: fraction of resampled means that are positive.
+
+    Deterministic (fixed RNG seed) so repeated comparisons agree. None when
+    there are too few paired seeds to resample meaningfully.
+    """
+    if len(deltas) < 2:
+        return None
+    rng = random.Random(seed)
+    n = len(deltas)
+    hits = 0
+    for _ in range(iterations):
+        total = 0.0
+        for _ in range(n):
+            total += deltas[rng.randrange(n)]
+        if total > 0.0:
+            hits += 1
+    return hits / iterations
 
 
 def _percentile(values: list[float], q: float) -> float | None:
@@ -158,6 +181,7 @@ def compare_runs(db: ExperimentDB, base_run_id: int, new_run_id: int) -> dict[st
         "median_effective_delta": statistics.median(deltas) if deltas else None,
         "min_effective_delta": min(deltas) if deltas else None,
         "max_effective_delta": max(deltas) if deltas else None,
+        "improve_confidence": _improve_confidence(deltas),
         "worsening_seeds": worsening[:20],
         "candidate_failure_count": len(candidate_failures),
         "candidate_failures": candidate_failures[:20],

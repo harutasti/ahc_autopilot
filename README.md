@@ -180,6 +180,33 @@ Useful roles include `ProblemAnalyst`, `CutBuilder`, `AnnealingBuilder`,
 overrides automatic specialist selection; `--focus` is injected into every agent
 prompt so candidates stay scoped.
 
+## Generation loop
+
+`autopilot` can run multiple improvement generations:
+
+```bash
+python3 tools/ahc.py autopilot --problem ahc067 --seeds 0-99 \
+  --generations 5 --agents 3 --validation-seeds 100-129
+```
+
+Each generation selects specialists from the latest analysis, runs all trials
+**in parallel** (each in its own workspace, adapter, and DB connection; limit
+concurrency with `--trial-jobs`), and then merges only the **best accepted
+candidate** into the mainline. The next generation branches from the merged
+solver and compares against the new baseline run. The loop stops early when a
+generation merges nothing (stagnation) or the `--budget` is exhausted.
+
+With `--validation-seeds`, an accepted candidate must also pass the acceptance
+gate on the held-out seeds before merging; this catches candidates that
+overfit the evaluation seed set. A candidate that wins on evaluation seeds but
+is rejected on validation seeds is recorded as `validation_failed`, and the
+next-best accepted candidate is tried instead.
+
+`compare` also reports `improve_confidence`: the paired-bootstrap probability
+that the mean improvement is real rather than seed noise. Set
+`acceptance.min_improve_confidence` (e.g. `0.9`) in `config.yaml` to make the
+gate reject low-confidence improvements.
+
 ## Evaluation performance
 
 Seed evaluation is parallel and cached:
@@ -216,10 +243,11 @@ python3 tools/ahc.py source --run 42 --checkout  # restore it into solver/
 `--checkout` snapshots the current `solver/` first, so the pre-checkout source
 is always recoverable via the printed `previous_source_hash`.
 
-When an autopilot trial is `accepted`, its source is automatically merged back
-into the mainline `solver/`, the merge is recorded in the `patches` table, and
-later trials in the same session compare against the new baseline run. Pass
-`--no-merge` to keep the old record-only behavior. Because the merged source
+When autopilot trials are `accepted`, the best one per generation (highest
+mean effective delta, validation-checked if `--validation-seeds` is set) is
+automatically merged back into the mainline `solver/`, the merge is recorded
+in the `patches` table, and the next generation compares against the new
+baseline run. Pass `--no-merge` to keep the record-only behavior. Because the merged source
 was already snapshotted by the candidate evaluation, a merge can never lose
 code: the previous mainline source stays available from the baseline run.
 

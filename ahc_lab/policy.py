@@ -18,17 +18,20 @@ class AcceptancePolicy:
     max_worsening_delta: float = 0.0
     max_elapsed_sec: float | None = None
     neutral_speedup_ratio: float = 0.05
+    min_improve_confidence: float | None = None
 
     @classmethod
     def from_config(cls, config: ProblemConfig) -> "AcceptancePolicy":
         raw = config.raw.get("acceptance")
         if not isinstance(raw, dict):
             raw = {}
+        confidence = raw.get("min_improve_confidence")
         return cls(
             max_worsening_seeds=int(raw.get("max_worsening_seeds", 0)),
             max_worsening_delta=float(raw.get("max_worsening_delta", 0.0)),
             max_elapsed_sec=float(raw.get("max_elapsed_sec", config.time_limit_sec)),
             neutral_speedup_ratio=float(raw.get("neutral_speedup_ratio", 0.05)),
+            min_improve_confidence=float(confidence) if confidence is not None else None,
         )
 
     def describe(self) -> dict[str, Any]:
@@ -37,6 +40,7 @@ class AcceptancePolicy:
             "max_worsening_delta": self.max_worsening_delta,
             "max_elapsed_sec": self.max_elapsed_sec,
             "neutral_speedup_ratio": self.neutral_speedup_ratio,
+            "min_improve_confidence": self.min_improve_confidence,
         }
 
 
@@ -94,6 +98,17 @@ def evaluate_acceptance(
         reasons.append(f"fixes {fixed} previously failing seed(s) without score regression")
         return _verdict("accepted", reasons, policy)
     if mean > 0.0:
+        confidence = comparison.get("improve_confidence")
+        if (
+            policy.min_improve_confidence is not None
+            and confidence is not None
+            and float(confidence) < policy.min_improve_confidence
+        ):
+            reasons.append(
+                f"improve confidence {float(confidence):.3f} is below the required "
+                f"{policy.min_improve_confidence}"
+            )
+            return _verdict("rejected", reasons, policy)
         reasons.append(
             f"mean effective delta {mean} is positive with {wins} win(s), {losses} loss(es)"
         )
