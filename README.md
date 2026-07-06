@@ -248,6 +248,23 @@ python3 tools/ahc.py autopilot --problem ahc067 --seeds 0-99 \
   --generations 5 --agents 3 --repair-attempts 1
 ```
 
+## Novelty filter
+
+Before a candidate is evaluated, its source is checked against every source
+already evaluated for the problem — both the exact content hash and a
+normalized fingerprint that ignores C++ comments and whitespace. A duplicate
+is skipped without spending any seed evaluations and recorded with decision
+`duplicate` (status `skipped`), including which run it duplicates. With
+`--repair-attempts`, the duplicate match is fed back to the agent ("your
+change is not novel — propose a materially different one") instead of ending
+the trial.
+
+The known-source index is snapshotted once per generation, so parallel trials
+that independently produce the same diff are still both evaluated rather than
+one being nondeterministically skipped. A repair attempt that leaves the
+source effectively unchanged (identical up to comments/whitespace) still stops
+the retry loop immediately. Disable the filter with `--no-novelty-filter`.
+
 ## Evaluation performance
 
 Seed evaluation is parallel and cached:

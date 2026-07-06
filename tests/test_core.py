@@ -18,6 +18,7 @@ from ahc_lab.config import load_problem_config
 from ahc_lab.db import ExperimentDB
 from ahc_lab.evaluator import Evaluator
 from ahc_lab.knowledge import search_knowledge
+from ahc_lab.novelty import normalize_cpp, normalized_source_fingerprint
 from ahc_lab.policy import AcceptancePolicy, evaluate_acceptance
 from ahc_lab.runner import run_shell
 from ahc_lab.seeds import parse_seed_spec
@@ -83,6 +84,18 @@ int main() {
 BROKEN_SOLVER = """
 #include <iostream>
 int main() { this does not compile
+"""
+
+ECHO_MINUS_TEN_COMMENTED_SOLVER = """
+// cosmetic edit: comments and whitespace only
+#include <iostream>
+/* block comment */
+int main() {
+    long long target;   // read the target
+    if (!(std::cin >> target))    return 0;
+    std::cout << target - 10 << '\\n';
+    return 0;
+}
 """
 
 
@@ -421,7 +434,10 @@ elif "target - 5" in text:
                     (result.session_id,),
                 )
             ]
-            self.assertEqual(decisions, ["accepted", "accepted", "neutral"])
+            # Generation 3 leaves the solver unchanged, so the novelty filter
+            # skips it as a duplicate of the merged source instead of
+            # re-evaluating it to a neutral verdict.
+            self.assertEqual(decisions, ["accepted", "accepted", "duplicate"])
 
     def test_parallel_trials_merge_best_only(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_s:
@@ -498,7 +514,7 @@ p.write_text({CRASHY_LARGE_TARGET_SOLVER!r}, encoding="utf-8")
 
 
 class AutopilotRepairTest(unittest.TestCase):
-    def _run(self, tmp: Path, adapter_body: str, *, repair_attempts: int):
+    def _run(self, tmp: Path, adapter_body: str, *, repair_attempts: int, **kwargs):
         tmp = _make_dummy_root(tmp, ECHO_MINUS_TEN_SOLVER)
         adapter = tmp / "adapter.py"
         adapter.write_text(adapter_body, encoding="utf-8")
@@ -507,10 +523,11 @@ class AutopilotRepairTest(unittest.TestCase):
             budget_sec=None,
             max_trials=1,
             agent_count=1,
-            seeds="0-2",
+            seeds=kwargs.pop("seeds", "0-2"),
             adapter_command=f"{sys.executable} {adapter} {{cwd}}",
             roles=["AnnealingBuilder"],
             repair_attempts=repair_attempts,
+            **kwargs,
         )
         trial = db.conn.execute(
             "select * from autopilot_trials where session_id = ?", (result.session_id,)
@@ -563,7 +580,10 @@ p.write_text({ECHO_MINUS_TWENTY_SOLVER!r}, encoding="utf-8")
             self.assertEqual(trial["decision"], "rejected")
             self.assertEqual(result.merged_count, 0)
             attempts = summary["repair"]["attempts"]
-            self.assertEqual([a["decision"] for a in attempts], ["rejected", "rejected"])
+            # The unchanged repair is detected before evaluation, so the second
+            # attempt is recorded as a duplicate and the trial keeps the
+            # rejected verdict of the first attempt.
+            self.assertEqual([a["decision"] for a in attempts], ["rejected", "duplicate"])
             self.assertTrue(attempts[1]["no_source_change"])
             self.assertTrue(
                 (result.prompt_dir / "g1_candidate_1_AnnealingBuilder_repair1.md").exists()
@@ -606,6 +626,142 @@ p.write_text({ECHO_MINUS_TWENTY_SOLVER!r}, encoding="utf-8")
             self.assertFalse(
                 (result.prompt_dir / "g1_candidate_1_AnnealingBuilder_repair1.md").exists()
             )
+
+    def test_pruned_rejection_feedback_notes_unevaluated_seeds(self) -> None:
+        adapter_body = f"""import pathlib, sys
+p = pathlib.Path(sys.argv[1]) / "solver" / "main.cpp"
+if "target - 20" in p.read_text(encoding="utf-8"):
+    p.write_text({ECHO_SOLVER!r}, encoding="utf-8")
+else:
+    p.write_text({ECHO_MINUS_TWENTY_SOLVER!r}, encoding="utf-8")
+"""
+        with tempfile.TemporaryDirectory() as tmp_s:
+            tmp = Path(tmp_s)
+            db, result, trial, summary = self._run(
+                tmp, adapter_body, repair_attempts=1, seeds="0-6"
+            )
+            self.assertEqual(trial["decision"], "accepted")
+            repair_prompt = (
+                result.prompt_dir / "g1_candidate_1_AnnealingBuilder_repair1.md"
+            ).read_text(encoding="utf-8")
+            self.assertIn("pruned early after 5 of 7 seeds", repair_prompt)
+            self.assertIn("were never evaluated because of the pruning", repair_prompt)
+
+    def test_repair_no_change_after_error_fails_trial(self) -> None:
+        adapter_body = f"""import pathlib, sys
+p = pathlib.Path(sys.argv[1]) / "solver" / "main.cpp"
+p.write_text({BROKEN_SOLVER!r}, encoding="utf-8")
+"""
+        with tempfile.TemporaryDirectory() as tmp_s:
+            tmp = Path(tmp_s)
+            db, result, trial, summary = self._run(tmp, adapter_body, repair_attempts=1)
+            self.assertEqual(trial["decision"], "error")
+            self.assertEqual(trial["status"], "failed")
+            attempts = summary["repair"]["attempts"]
+            self.assertEqual([a["decision"] for a in attempts], ["error", "duplicate"])
+            self.assertTrue(attempts[1]["no_source_change"])
+            self.assertIn("build failed", summary["error"])
+
+
+class NoveltyUnitTest(unittest.TestCase):
+    def test_normalize_cpp_strips_comments_and_whitespace(self) -> None:
+        self.assertEqual(
+            normalize_cpp(ECHO_MINUS_TEN_COMMENTED_SOLVER),
+            normalize_cpp(ECHO_MINUS_TEN_SOLVER),
+        )
+
+    def test_normalize_cpp_preserves_string_literals(self) -> None:
+        code = 'const char *url = "http://example.com"; // real comment\n'
+        normalized = normalize_cpp(code)
+        self.assertIn("http://example.com", normalized)
+        self.assertNotIn("real comment", normalized)
+
+    def test_normalize_cpp_block_comment_separates_tokens(self) -> None:
+        self.assertNotEqual(normalize_cpp("int a/*x*/b;"), normalize_cpp("int ab;"))
+
+    def test_normalized_fingerprint_matches_cosmetic_variant_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_s:
+            tmp = Path(tmp_s)
+            for name, source in [
+                ("plain", ECHO_MINUS_TEN_SOLVER),
+                ("commented", ECHO_MINUS_TEN_COMMENTED_SOLVER),
+                ("different", ECHO_SOLVER),
+            ]:
+                (tmp / name).mkdir()
+                (tmp / name / "main.cpp").write_text(source, encoding="utf-8")
+            plain = normalized_source_fingerprint(tmp / "plain")
+            self.assertEqual(plain, normalized_source_fingerprint(tmp / "commented"))
+            self.assertNotEqual(plain, normalized_source_fingerprint(tmp / "different"))
+
+
+class AutopilotNoveltyTest(unittest.TestCase):
+    def _run(self, tmp: Path, adapter_body: str, **kwargs):
+        tmp = _make_dummy_root(tmp, ECHO_MINUS_TEN_SOLVER)
+        adapter = tmp / "adapter.py"
+        adapter.write_text(adapter_body, encoding="utf-8")
+        db = ExperimentDB.default(tmp)
+        result = Autopilot(tmp, "dummy", db).run(
+            budget_sec=None,
+            max_trials=1,
+            agent_count=1,
+            seeds="0-2",
+            adapter_command=f"{sys.executable} {adapter} {{cwd}}",
+            roles=["AnnealingBuilder"],
+            **kwargs,
+        )
+        trial = db.conn.execute(
+            "select * from autopilot_trials where session_id = ?", (result.session_id,)
+        ).fetchone()
+        return db, result, trial, json.loads(trial["summary_json"])
+
+    COSMETIC_ADAPTER = f"""import pathlib, sys
+p = pathlib.Path(sys.argv[1]) / "solver" / "main.cpp"
+p.write_text({ECHO_MINUS_TEN_COMMENTED_SOLVER!r}, encoding="utf-8")
+"""
+
+    def test_cosmetic_duplicate_is_skipped_before_evaluation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_s:
+            tmp = Path(tmp_s)
+            db, result, trial, summary = self._run(tmp, self.COSMETIC_ADAPTER)
+            self.assertEqual(trial["decision"], "duplicate")
+            self.assertEqual(trial["status"], "skipped")
+            self.assertIsNone(trial["new_run_id"])
+            self.assertEqual(summary["duplicate"]["match"], "normalized")
+            self.assertEqual(summary["duplicate"]["run_id"], result.baseline_run_id)
+            candidate_runs = db.conn.execute(
+                "select count(*) as n from runs where run_type = 'candidate'"
+            ).fetchone()["n"]
+            self.assertEqual(candidate_runs, 0)
+
+    def test_duplicate_feedback_leads_to_novel_candidate(self) -> None:
+        adapter_body = f"""import pathlib, sys
+p = pathlib.Path(sys.argv[1]) / "solver" / "main.cpp"
+if "// cosmetic" in p.read_text(encoding="utf-8"):
+    p.write_text({ECHO_SOLVER!r}, encoding="utf-8")
+else:
+    p.write_text({ECHO_MINUS_TEN_COMMENTED_SOLVER!r}, encoding="utf-8")
+"""
+        with tempfile.TemporaryDirectory() as tmp_s:
+            tmp = Path(tmp_s)
+            db, result, trial, summary = self._run(tmp, adapter_body, repair_attempts=1)
+            self.assertEqual(trial["decision"], "accepted")
+            self.assertEqual(result.merged_count, 1)
+            attempts = summary["repair"]["attempts"]
+            self.assertEqual([a["decision"] for a in attempts], ["duplicate", "accepted"])
+            repair_prompt = (
+                result.prompt_dir / "g1_candidate_1_AnnealingBuilder_repair1.md"
+            ).read_text(encoding="utf-8")
+            self.assertIn("not novel", repair_prompt)
+            self.assertIn("comments/whitespace", repair_prompt)
+
+    def test_novelty_filter_can_be_disabled(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_s:
+            tmp = Path(tmp_s)
+            db, result, trial, summary = self._run(
+                tmp, self.COSMETIC_ADAPTER, novelty_filter=False
+            )
+            self.assertNotEqual(trial["decision"], "duplicate")
+            self.assertIsNotNone(trial["new_run_id"])
 
 
 class AcceptanceGateTest(unittest.TestCase):

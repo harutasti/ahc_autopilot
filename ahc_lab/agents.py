@@ -13,10 +13,16 @@ from .analysis import analyze_run, compare_runs, make_ai_brief, write_analysis_m
 from .db import ExperimentDB
 from .evaluator import Evaluator, default_jobs
 from .knowledge import search_knowledge
+from .novelty import find_duplicate, known_source_index, normalized_source_fingerprint
 from .policy import AcceptancePolicy, evaluate_acceptance
 from .runner import run_shell
 from .seeds import parse_seed_spec
-from .snapshots import diff_snapshots, restore_solver_source, store_dir_for
+from .snapshots import (
+    diff_snapshots,
+    restore_solver_source,
+    snapshot_solver_source,
+    store_dir_for,
+)
 from .workspace import create_candidate_workspace
 
 
@@ -151,12 +157,14 @@ def build_repair_prompt(
     comparison: dict[str, Any] | None,
     error: str | None,
     original_prompt: str,
+    duplicate: dict[str, Any] | None = None,
+    cascade: dict[str, Any] | None = None,
 ) -> str:
     """Feedback prompt for one repair attempt on a rejected or failed candidate.
 
     The adapter is stateless, so the prompt embeds everything the agent needs:
-    the gate verdict with its measured numbers (or the failure text) plus the
-    original task prompt.
+    the gate verdict with its measured numbers (or the failure text, or the
+    novelty-filter match) plus the original task prompt.
     """
     if error is not None:
         diagnosis = (
@@ -165,15 +173,33 @@ def build_repair_prompt(
             "Fix the failure first (build error, tool crash, or timeout), then make\n"
             "sure the candidate still implements your hypothesis."
         )
+    elif duplicate is not None:
+        diagnosis = (
+            "Your change is not novel:\n"
+            f"- {duplicate['reason']}\n\n"
+            "Duplicate candidates are skipped before evaluation. Propose a materially\n"
+            "different change — a different hypothesis, neighborhood, or parameter\n"
+            "setting — not a cosmetic edit of already-tried source."
+        )
     else:
         reasons = "\n".join(f"- {r}" for r in (verdict or {}).get("reasons") or [])
         policy_desc = json.dumps((verdict or {}).get("policy") or {}, sort_keys=True)
+        pruned_note = ""
+        if cascade and cascade.get("pruned"):
+            pruned_note = (
+                "\n\nNote: evaluation was pruned early after "
+                f"{cascade.get('evaluated_seed_count')} of {cascade.get('total_seed_count')} "
+                f"seeds ({cascade.get('prune_reason')}). Seeds listed with status \"missing\"\n"
+                "were never evaluated because of the pruning, not because the solver\n"
+                "crashed on them."
+            )
         diagnosis = (
             "The acceptance gate rejected your candidate for these reasons:\n"
             f"{reasons}\n\n"
             "Measured numbers (candidate vs baseline):\n"
             f"{_format_gate_numbers(comparison or {})}\n\n"
             f"Gate policy: {policy_desc}"
+            f"{pruned_note}"
         )
     return f"""You are {agent_name}. Your candidate `{candidate_name}` (attempt {attempt}) was NOT accepted.
 
@@ -257,6 +283,7 @@ class Autopilot:
         validation_seeds: str | None = None,
         trial_jobs: int | None = None,
         repair_attempts: int = 0,
+        novelty_filter: bool = True,
     ) -> AutopilotResult:
         session_id = self.db.create_session(self.problem, budget_sec, agent_count)
         status = "aborted"
@@ -278,6 +305,7 @@ class Autopilot:
                 validation_seeds=validation_seeds,
                 trial_jobs=trial_jobs,
                 repair_attempts=repair_attempts,
+                novelty_filter=novelty_filter,
             )
             status = result.status
             return result
@@ -303,6 +331,7 @@ class Autopilot:
         validation_seeds: str | None,
         trial_jobs: int | None,
         repair_attempts: int,
+        novelty_filter: bool,
     ) -> AutopilotResult:
         started = time.monotonic()
         seed_list = parse_seed_spec(seeds) or list(range(10))
@@ -397,6 +426,14 @@ class Autopilot:
             per_trial_jobs = (
                 jobs if jobs is not None else max(1, default_jobs() // max(1, len(trials)))
             )
+            # Snapshot the known-source index once per generation, before trials
+            # launch: parallel trials submitting the same diff race benignly (both
+            # evaluate), instead of nondeterministically marking one a duplicate.
+            novelty_index = (
+                known_source_index(self.db, store_dir_for(self.db), self.problem)
+                if novelty_filter
+                else None
+            )
             outcomes: list[TrialOutcome] = []
             with ThreadPoolExecutor(max_workers=max(1, trial_jobs or len(trials))) as pool:
                 futures = [
@@ -411,6 +448,7 @@ class Autopilot:
                         cascade=cascade,
                         session_id=session_id,
                         repair_attempts=repair_attempts,
+                        novelty_index=novelty_index,
                         **trial,
                     )
                     for trial in trials
@@ -498,14 +536,21 @@ class Autopilot:
         cascade: bool,
         session_id: int,
         repair_attempts: int = 0,
+        novelty_index: dict[str, dict[str, int]] | None = None,
     ) -> TrialOutcome:
         """Run one trial in a worker thread with its own DB connection.
 
-        With `repair_attempts` > 0, a rejected verdict (or a failed attempt) is
-        fed back to the same workspace agent as a repair prompt: the gate
-        reasons and measured numbers, so the agent fixes the candidate instead
-        of the hypothesis being retried blind. Retrying stops early when a
-        repair leaves the source unchanged, since the verdict cannot change.
+        Before evaluation, the candidate source is checked against the
+        `novelty_index` of already-evaluated sources (exact and
+        comment/whitespace-normalized hashes); duplicates are skipped without
+        spending seed evaluations.
+
+        With `repair_attempts` > 0, a rejected verdict, a duplicate match, or a
+        failed attempt is fed back to the same workspace agent as a repair
+        prompt: the gate reasons and measured numbers, so the agent fixes the
+        candidate instead of the hypothesis being retried blind. Retrying
+        stops early when a repair leaves the source effectively unchanged,
+        since the outcome cannot change.
         """
         db = ExperimentDB(self.db.path)
         candidate_root = Path(workspace_path)
@@ -517,14 +562,18 @@ class Autopilot:
         candidate_run_id: int | None = None
         summary: dict[str, Any] | None = None
         decision = "error"
+        trial_status = "evaluated"
         mean_delta = 0.0
-        previous_hash: str | None = None
+        own_exact: set[str] = set()
+        own_norm: set[str] = set()
         try:
             for attempt in range(1, max_attempts + 1):
                 log_suffix = "" if attempt == 1 else f"_repair{attempt - 1}"
                 comparison: dict[str, Any] | None = None
                 verdict: dict[str, Any] | None = None
                 error_text: str | None = None
+                duplicate_info: dict[str, Any] | None = None
+                cascade_info: dict[str, Any] | None = None
                 try:
                     self._run_adapter(
                         adapter_command,
@@ -533,55 +582,113 @@ class Autopilot:
                         trial_id=trial_id,
                         log_suffix=log_suffix,
                     )
-                    candidate_evaluator = Evaluator(candidate_root, self.problem, db)
-                    cascade_info: dict[str, Any] | None = None
-                    parent_run_id = (
-                        candidate_run_id if candidate_run_id is not None else baseline_run_id
+                    exact_hash = snapshot_solver_source(candidate_root, store_dir_for(db))
+                    norm_hash = (
+                        normalized_source_fingerprint(candidate_root / "solver")
+                        if exact_hash is not None
+                        else None
                     )
-                    if cascade:
-                        run_id, cascade_info = candidate_evaluator.evaluate_cascade(
-                            seed_list,
-                            tag=candidate_tag + log_suffix,
-                            baseline_run_id=baseline_run_id,
-                            policy=policy,
-                            run_type="candidate",
-                            jobs=jobs,
-                            use_cache=use_cache,
-                            parent_run_id=parent_run_id,
-                        )
-                    else:
-                        run_id = candidate_evaluator.evaluate(
-                            seed_list,
-                            tag=candidate_tag + log_suffix,
-                            run_type="candidate",
-                            jobs=jobs,
-                            use_cache=use_cache,
-                            parent_run_id=parent_run_id,
-                        )
-                    comparison = compare_runs(db, baseline_run_id, run_id)
-                    verdict = evaluate_acceptance(comparison, policy)
-                    decision = verdict["decision"]
-                    source_hash = db.get_run(run_id).get("source_hash")
-                    no_change = (
-                        attempt > 1 and source_hash is not None and source_hash == previous_hash
+                    no_change = exact_hash is not None and (
+                        exact_hash in own_exact
+                        or (norm_hash is not None and norm_hash in own_norm)
                     )
-                    attempt_row: dict[str, Any] = {
-                        "attempt": attempt,
-                        "run_id": run_id,
-                        "decision": decision,
-                        "reasons": verdict["reasons"],
-                    }
                     if no_change:
-                        attempt_row["no_source_change"] = True
-                    attempts.append(attempt_row)
-                    candidate_run_id = run_id
-                    previous_hash = source_hash
-                    mean_delta = float(comparison.get("mean_effective_delta") or 0.0)
-                    summary = {**comparison, "acceptance": verdict}
-                    if cascade_info is not None:
-                        summary["cascade"] = cascade_info
-                    if decision != "rejected" or no_change or attempt == max_attempts:
+                        attempts.append(
+                            {
+                                "attempt": attempt,
+                                "decision": "duplicate",
+                                "reasons": ["repair produced no effective source change"],
+                                "no_source_change": True,
+                            }
+                        )
+                        if summary is None:
+                            previous = attempts[-2]
+                            reasons = "; ".join(str(r) for r in previous["reasons"])
+                            if previous["decision"] == "duplicate":
+                                decision = "duplicate"
+                                trial_status = "skipped"
+                                summary = {
+                                    "acceptance": {
+                                        "decision": "duplicate",
+                                        "reasons": previous["reasons"],
+                                    }
+                                }
+                            else:
+                                decision = "error"
+                                trial_status = "failed"
+                                summary = {"error": reasons}
                         break
+                    if exact_hash is not None:
+                        own_exact.add(exact_hash)
+                    if norm_hash is not None:
+                        own_norm.add(norm_hash)
+                    duplicate_info = find_duplicate(novelty_index, exact_hash, norm_hash)
+                    if duplicate_info is not None:
+                        attempts.append(
+                            {
+                                "attempt": attempt,
+                                "decision": "duplicate",
+                                "reasons": [duplicate_info["reason"]],
+                                "duplicate_of_run_id": duplicate_info["run_id"],
+                            }
+                        )
+                        if attempt == max_attempts:
+                            decision = "duplicate"
+                            trial_status = "skipped"
+                            summary = {
+                                "acceptance": {
+                                    "decision": "duplicate",
+                                    "reasons": [duplicate_info["reason"]],
+                                },
+                                "duplicate": {
+                                    "match": duplicate_info["match"],
+                                    "run_id": duplicate_info["run_id"],
+                                },
+                            }
+                            break
+                    else:
+                        candidate_evaluator = Evaluator(candidate_root, self.problem, db)
+                        parent_run_id = (
+                            candidate_run_id if candidate_run_id is not None else baseline_run_id
+                        )
+                        if cascade:
+                            run_id, cascade_info = candidate_evaluator.evaluate_cascade(
+                                seed_list,
+                                tag=candidate_tag + log_suffix,
+                                baseline_run_id=baseline_run_id,
+                                policy=policy,
+                                run_type="candidate",
+                                jobs=jobs,
+                                use_cache=use_cache,
+                                parent_run_id=parent_run_id,
+                            )
+                        else:
+                            run_id = candidate_evaluator.evaluate(
+                                seed_list,
+                                tag=candidate_tag + log_suffix,
+                                run_type="candidate",
+                                jobs=jobs,
+                                use_cache=use_cache,
+                                parent_run_id=parent_run_id,
+                            )
+                        comparison = compare_runs(db, baseline_run_id, run_id)
+                        verdict = evaluate_acceptance(comparison, policy)
+                        decision = verdict["decision"]
+                        attempts.append(
+                            {
+                                "attempt": attempt,
+                                "run_id": run_id,
+                                "decision": decision,
+                                "reasons": verdict["reasons"],
+                            }
+                        )
+                        candidate_run_id = run_id
+                        mean_delta = float(comparison.get("mean_effective_delta") or 0.0)
+                        summary = {**comparison, "acceptance": verdict}
+                        if cascade_info is not None:
+                            summary["cascade"] = cascade_info
+                        if decision != "rejected" or attempt == max_attempts:
+                            break
                 except Exception as exc:
                     error_text = str(exc)
                     attempts.append(
@@ -599,6 +706,8 @@ class Autopilot:
                     comparison=comparison,
                     error=error_text,
                     original_prompt=original_prompt,
+                    duplicate=duplicate_info,
+                    cascade=cascade_info,
                 )
                 active_prompt_path = prompt_path.with_name(
                     f"{candidate_name}_repair{attempt}.md"
@@ -608,11 +717,11 @@ class Autopilot:
             assert summary is not None  # loop always breaks with a summary or raises
             if len(attempts) > 1:
                 summary["repair"] = {"attempts": attempts}
-            if decision == "rejected":
+            if decision in ("rejected", "duplicate"):
                 db.update_scorecard(agent_name, False, mean_delta)
             db.finish_trial(
                 trial_id,
-                status="evaluated",
+                status=trial_status,
                 decision=decision,
                 new_run_id=candidate_run_id,
                 summary=summary,

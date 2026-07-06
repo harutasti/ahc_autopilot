@@ -108,6 +108,14 @@ def main(argv: list[str] | None = None) -> int:
             "same workspace agent and retry up to N times per trial (default: 0)"
         ),
     )
+    p.add_argument(
+        "--no-novelty-filter",
+        action="store_true",
+        help=(
+            "evaluate candidates even when their source is identical (exactly or up to "
+            "comments/whitespace) to an already-evaluated run"
+        ),
+    )
 
     p = sub.add_parser("source")
     p.add_argument("--run", type=int, required=True)
@@ -193,6 +201,7 @@ def main(argv: list[str] | None = None) -> int:
             validation_seeds=args.validation_seeds,
             trial_jobs=args.trial_jobs,
             repair_attempts=args.repair_attempts,
+            novelty_filter=not args.no_novelty_filter,
         )
         print(json.dumps({
             "session_id": result.session_id,
