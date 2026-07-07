@@ -36,3 +36,13 @@ Auto-generated per generation.
 ## 2026-07-07 03:17 g1 PerformanceBuilder -> error
 - verdict: adapter failed with exit code 1; see /home/user/ahc_autopilot/experiments/adapter_logs/trial_8_repair1.stderr.txt
 - repair attempts: 2 (error -> error)
+
+## 2026-07-07 03:49 g1 CutBuilder -> error
+- verdict: adapter failed with exit code 124; see /home/user/ahc_autopilot/experiments/adapter_logs/trial_9_repair1.stderr.txt
+- repair attempts: 2 (error -> error)
+
+## 2026-07-07 03:49 g1 AnnealingBuilder -> rejected
+- mean effective delta -1534.2333333333333, confidence 0.27, wins/ties/losses 1/28/1
+- verdict: 1 worsening seed(s) exceed the budget of 0; worst per-seed worsening 73249.0 exceeds the budget of 0.0
+- repair attempts: 2 (error -> rejected)
+- agent summary tail: * I also recorded in `knowledge/ahc067.md` that this solver's wall-clock-bounded anneal loops introduce real run-to-run score noise (observed swings up to ~1.3%), so small A/B deltas need repeated trials to trust, and that the 2/8/11/16 tie looks like it may be a structural ceiling rather than a reachable-but-stuck local optimum — worth investigating before further local-search variants target it.
