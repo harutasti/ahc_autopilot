@@ -28,3 +28,11 @@ Auto-generated per generation.
 - verdict: adapter failed with exit code 1; see /home/user/ahc_autopilot/experiments/adapter_logs/trial_6_repair1.stderr.txt
 - repair attempts: 2 (error -> error)
 - agent summary tail: You've hit your session limit · resets 3am (UTC)
+
+## 2026-07-07 03:17 g1 CutBuilder -> error
+- verdict: adapter failed with exit code 1; see /home/user/ahc_autopilot/experiments/adapter_logs/trial_7_repair1.stderr.txt
+- repair attempts: 2 (error -> error)
+
+## 2026-07-07 03:17 g1 PerformanceBuilder -> error
+- verdict: adapter failed with exit code 1; see /home/user/ahc_autopilot/experiments/adapter_logs/trial_8_repair1.stderr.txt
+- repair attempts: 2 (error -> error)
