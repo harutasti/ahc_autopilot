@@ -46,3 +46,17 @@ Auto-generated per generation.
 - verdict: 1 worsening seed(s) exceed the budget of 0; worst per-seed worsening 73249.0 exceeds the budget of 0.0
 - repair attempts: 2 (error -> rejected)
 - agent summary tail: * I also recorded in `knowledge/ahc067.md` that this solver's wall-clock-bounded anneal loops introduce real run-to-run score noise (observed swings up to ~1.3%), so small A/B deltas need repeated trials to trust, and that the 2/8/11/16 tie looks like it may be a structural ceiling rather than a reachable-but-stuck local optimum — worth investigating before further local-search variants target it.
+
+## 2026-07-07 14:44 g1 CutBuilder -> rejected
+- mean effective delta -15566.6, confidence 0.0, wins/ties/losses 0/3/2
+- verdict: candidate fails or misses 25 seed(s) the baseline solves; 2 worsening seed(s) exceed the budget of 1
+- repair attempts: 2 (rejected -> rejected)
+- pruned early: 2 worsening seed(s) exceed the budget of 1
+- agent summary tail: ce gate's single-shot per-seed comparison carries real inherent noise (tens of thousands of points) independent of code correctness — that variance may still occasionally register as a "worsening seed" even for a logically-safe change. The fix minimizes structural risk to what's achievable within CutBuilder's scope; it does not address the underlying timing sensitivity, which is out of scope here.
+
+## 2026-07-07 14:44 g1 GateReuseBuilder -> rejected
+- mean effective delta -11837.6, confidence 0.0, wins/ties/losses 0/3/2
+- verdict: candidate fails or misses 25 seed(s) the baseline solves; 2 worsening seed(s) exceed the budget of 1
+- repair attempts: 2 (duplicate -> rejected)
+- pruned early: 2 worsening seed(s) exceed the budget of 1
+- agent summary tail: Not essential — I'll just wait for the background task notification.
