@@ -287,6 +287,11 @@ Rules:
 - Each role must target a different improvement direction; no near-duplicates.
 - Focus statements must be concrete and scoped to one change, grounded in the
   analysis (bad seeds, timing, score distribution), not generic advice.
+- Each focus must be completable by ONE agent invocation (a bounded coding
+  session). If a promising direction is too large, assign only its smallest
+  independently-evaluable first stage and note the follow-up in the focus.
+- If the knowledge section records repeated timeouts or failures for a
+  direction, do not re-assign it unchanged; either stage it down or drop it.
 - Role names may use letters, digits, and underscore only.
 - Write only `roles.json`; do not modify any solver source.
 
