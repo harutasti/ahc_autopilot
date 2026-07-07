@@ -509,59 +509,86 @@ struct AHC067Solver {
         return best;
     }
 
-    // Composite layer-cut portfolio: stack a layer cut on top of the current best
-    // solution (e.g. a bridge solution) and try pairs of distinct layer cuts.
-    // Every trial is gated by exact BFS via evaluate(), and a result is returned
-    // only when it strictly beats the incoming best_t, so output never worsens.
+    // Composite layer-cut portfolio: repeatedly stack additional gates (drawn
+    // from a combined bridge + layer-cut pool) on top of the current best
+    // solution, filling toward the full K switch budget instead of stopping
+    // after a single appended gate. Falls back to a from-scratch pair search
+    // when stacking made little progress (e.g. no usable base solution).
+    // Every trial is gated by exact BFS via evaluate(), and a result is
+    // returned only when it strictly beats the incoming best_t, so output
+    // never worsens.
     vector<Gate> composite_layer_search(const vector<Gate> &base, const vector<Candidate> &candidates,
                                         const Timer &timer, double time_limit, int &best_t,
                                         int &iterations) {
-        vector<Gate> best;
+        vector<Gate> current = base;
+        int current_t = best_t;
+        vector<Gate> best = current;
 
-        // A) base solution plus one appended layer cut, using an unused switch slot.
-        if (static_cast<int>(base.size()) < k) {
+        // A) Greedily append the single best candidate gate, repeating until
+        // the K switch slots are full, no candidate helps anymore, or the
+        // time budget for this phase runs out. This fills closer to the full
+        // switch budget instead of stopping at base+1.
+        bool progressed = true;
+        while (progressed && static_cast<int>(current.size()) < k && timer.elapsed() < time_limit) {
+            progressed = false;
+            Gate best_gate{{}, -1};
+            int best_gate_t = current_t;
             for (const Candidate &cand : candidates) {
                 if (timer.elapsed() >= time_limit) break;
                 Gate gate{cand.edges, cand.sw};
-                if (conflicts_after_replace(base, -1, gate)) continue;
-                vector<Gate> trial = base;
+                if (conflicts_after_replace(current, -1, gate)) continue;
+                vector<Gate> trial = current;
                 trial.push_back(gate);
                 iterations++;
                 int t = evaluate(trial);
-                if (t > best_t) {
-                    best_t = t;
-                    best = trial;
+                if (t > best_gate_t) {
+                    best_gate_t = t;
+                    best_gate = gate;
+                }
+            }
+            if (!best_gate.edges.empty()) {
+                current.push_back(best_gate);
+                current_t = best_gate_t;
+                progressed = true;
+                if (current_t > best_t) {
+                    best_t = current_t;
+                    best = current;
                 }
             }
         }
 
-        // B) pairs of distinct layer cuts with distinct switch types. The outer
-        // index is capped to the highest-priority candidates to bound the work.
-        const int outer_limit = min(static_cast<int>(candidates.size()), 16);
-        for (int a = 0; a < outer_limit && timer.elapsed() < time_limit; a++) {
-            const Candidate &ca = candidates[a];
-            for (int b = a + 1; b < static_cast<int>(candidates.size()); b++) {
-                if (timer.elapsed() >= time_limit) break;
-                const Candidate &cb = candidates[b];
-                if (ca.sw == cb.sw) continue;
-                if (static_cast<int>(ca.edges.size() + cb.edges.size()) > m) continue;
-                bool overlap = false;
-                for (int e1 : ca.edges) {
-                    for (int e2 : cb.edges) {
-                        if (e1 == e2) {
-                            overlap = true;
-                            break;
+        // B) If stacking made little progress (e.g. there was no usable base
+        // solution to build on), also try pairs of distinct candidates built
+        // from scratch, in case a fresh pair beats the greedy stack above.
+        // The outer index is capped to the highest-priority candidates to
+        // bound the work.
+        if (static_cast<int>(current.size()) <= 2) {
+            const int outer_limit = min(static_cast<int>(candidates.size()), 16);
+            for (int a = 0; a < outer_limit && timer.elapsed() < time_limit; a++) {
+                const Candidate &ca = candidates[a];
+                for (int b = a + 1; b < static_cast<int>(candidates.size()); b++) {
+                    if (timer.elapsed() >= time_limit) break;
+                    const Candidate &cb = candidates[b];
+                    if (ca.sw == cb.sw) continue;
+                    if (static_cast<int>(ca.edges.size() + cb.edges.size()) > m) continue;
+                    bool overlap = false;
+                    for (int e1 : ca.edges) {
+                        for (int e2 : cb.edges) {
+                            if (e1 == e2) {
+                                overlap = true;
+                                break;
+                            }
                         }
+                        if (overlap) break;
                     }
-                    if (overlap) break;
-                }
-                if (overlap) continue;
-                vector<Gate> trial{{ca.edges, ca.sw}, {cb.edges, cb.sw}};
-                iterations++;
-                int t = evaluate(trial);
-                if (t > best_t) {
-                    best_t = t;
-                    best = trial;
+                    if (overlap) continue;
+                    vector<Gate> trial{{ca.edges, ca.sw}, {cb.edges, cb.sw}};
+                    iterations++;
+                    int t = evaluate(trial);
+                    if (t > best_t) {
+                        best_t = t;
+                        best = trial;
+                    }
                 }
             }
         }
@@ -594,16 +621,28 @@ struct AHC067Solver {
         candidate_count = max(candidate_count, static_cast<int>(broad_candidates.size() + layer_candidates.size()));
         if (layer_candidates.empty()) return solution;
 
-        vector<Gate> layer_single = best_single_candidate(layer_candidates, timer, 1.62, best_t, iterations);
+        vector<Gate> layer_single = best_single_candidate(layer_candidates, timer, 1.60, best_t, iterations);
         if (!layer_single.empty()) {
             solution = layer_single;
         }
 
-        vector<Gate> composite = composite_layer_search(solution, layer_candidates, timer, 1.66,
+        // Pool bridge and layer-cut candidates together so stacking can pick
+        // whichever gate type helps most at each remaining switch slot.
+        vector<Candidate> combined_candidates = broad_candidates;
+        combined_candidates.insert(combined_candidates.end(), layer_candidates.begin(), layer_candidates.end());
+        sort_and_trim_candidates(combined_candidates, 260);
+
+        vector<Gate> composite = composite_layer_search(solution, combined_candidates, timer, 1.78,
                                                         best_t, iterations);
         if (!composite.empty()) {
             solution = composite;
         }
+
+        // Spend the remaining time budget polishing the stacked solution with
+        // swap-based hillclimb/anneal over the combined pool, instead of
+        // leaving it unused.
+        solution = improve(solution, combined_candidates, best_t, timer, best_t, iterations, accepted,
+                           1.78, 1.88);
         return solution;
     }
 
