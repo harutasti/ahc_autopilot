@@ -16,6 +16,7 @@ from ahc_lab.agents import (
     SPECIALISTS,
     Autopilot,
     build_agent_prompt,
+    classify_adapter_failure,
     parse_roles_file,
     select_specialists,
 )
@@ -669,6 +670,161 @@ p.write_text({BROKEN_SOLVER!r}, encoding="utf-8")
             self.assertEqual([a["decision"] for a in attempts], ["error", "duplicate"])
             self.assertTrue(attempts[1]["no_source_change"])
             self.assertIn("build failed", summary["error"])
+
+
+class AdapterFatalTest(unittest.TestCase):
+    def test_classify_adapter_failure(self) -> None:
+        self.assertEqual(
+            classify_adapter_failure("You've hit your session limit · resets 3am (UTC)"),
+            "rate_limit",
+        )
+        self.assertEqual(
+            classify_adapter_failure(
+                "--dangerously-skip-permissions cannot be used with root/sudo privileges"
+            ),
+            "config",
+        )
+        self.assertEqual(classify_adapter_failure("Invalid API key provided"), "auth")
+        self.assertIsNone(classify_adapter_failure("g++: error: main.cpp: No such file"))
+        self.assertIsNone(classify_adapter_failure(""))
+
+    def test_fatal_adapter_failure_skips_repair_and_aborts_session(self) -> None:
+        adapter_body = """import sys
+print("You've hit your session limit · resets 3am (UTC)")
+sys.exit(1)
+"""
+        with tempfile.TemporaryDirectory() as tmp_s:
+            tmp = _make_dummy_root(Path(tmp_s), ECHO_MINUS_TEN_SOLVER)
+            adapter = tmp / "adapter.py"
+            adapter.write_text(adapter_body, encoding="utf-8")
+            db = ExperimentDB.default(tmp)
+            result = Autopilot(tmp, "dummy", db).run(
+                budget_sec=None,
+                max_trials=1,
+                agent_count=1,
+                seeds="0-2",
+                adapter_command=f"{sys.executable} {adapter} {{cwd}}",
+                roles=["AnnealingBuilder"],
+                repair_attempts=3,
+                generations=4,
+            )
+            self.assertEqual(result.status, "adapter_fatal")
+            self.assertEqual(result.generations_run, 1)
+            self.assertEqual(result.merged_count, 0)
+            trial = db.conn.execute(
+                "select * from autopilot_trials where session_id = ?", (result.session_id,)
+            ).fetchone()
+            summary = json.loads(trial["summary_json"])
+            self.assertEqual(trial["decision"], "error")
+            self.assertTrue(summary["fatal"])
+            self.assertIn("rate_limit", summary["error"])
+            # No repair retry happened despite repair_attempts=3.
+            self.assertNotIn("repair", summary)
+            self.assertFalse(
+                (result.prompt_dir / "g1_candidate_1_AnnealingBuilder_repair1.md").exists()
+            )
+            session = db.conn.execute(
+                "select status from autopilot_sessions where id = ?", (result.session_id,)
+            ).fetchone()
+            self.assertEqual(session["status"], "adapter_fatal")
+            fatal_message = db.conn.execute(
+                "select content from agent_messages where agent_name='Autopilot' and role='fatal'"
+            ).fetchone()
+            self.assertIsNotNone(fatal_message)
+
+
+class ElapsedRemeasureTest(unittest.TestCase):
+    def test_noisy_elapsed_is_remeasured_and_overridden(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_s:
+            tmp = _make_dummy_root(Path(tmp_s), ECHO_MINUS_TEN_SOLVER)
+            db = ExperimentDB.default(tmp)
+            base_run = Evaluator(tmp, "dummy", db).evaluate([0, 1, 2], tag="base")
+            (tmp / "solver" / "main.cpp").write_text(ECHO_SOLVER, encoding="utf-8")
+            evaluator = Evaluator(tmp, "dummy", db)
+            cand_run = evaluator.evaluate([0, 1, 2], tag="cand")
+            # Simulate contention noise: one seed's recorded elapsed exceeds
+            # the 2.0s gate even though the solver is instant.
+            db.conn.execute(
+                "update cases set elapsed_sec = 5.0 where run_id = ? and seed = 1",
+                (cand_run,),
+            )
+            db.conn.commit()
+            policy = AcceptancePolicy.from_config(evaluator.config)
+            comparison = compare_runs(db, base_run, cand_run)
+            verdict = evaluate_acceptance(comparison, policy)
+            self.assertEqual(verdict["decision"], "rejected")
+            self.assertTrue(
+                all(str(r).startswith("max elapsed") for r in verdict["reasons"])
+            )
+            info = Autopilot(tmp, "dummy", db)._remeasure_elapsed(
+                evaluator, db, cand_run, policy
+            )
+            self.assertTrue(info["passed"])
+            self.assertEqual(list(info["seeds"]), ["1"])
+            comparison = compare_runs(db, base_run, cand_run)
+            verdict = evaluate_acceptance(comparison, policy)
+            self.assertEqual(verdict["decision"], "accepted")
+
+    def test_remeasure_skips_when_no_seed_is_over_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_s:
+            tmp = _make_dummy_root(Path(tmp_s), ECHO_SOLVER)
+            db = ExperimentDB.default(tmp)
+            evaluator = Evaluator(tmp, "dummy", db)
+            run_id = evaluator.evaluate([0, 1], tag="fast")
+            policy = AcceptancePolicy.from_config(evaluator.config)
+            self.assertIsNone(
+                Autopilot(tmp, "dummy", db)._remeasure_elapsed(
+                    evaluator, db, run_id, policy
+                )
+            )
+
+
+class AdapterTimeoutSalvageTest(unittest.TestCase):
+    def _run(self, tmp: Path, adapter_body: str):
+        tmp = _make_dummy_root(tmp, ECHO_MINUS_TEN_SOLVER)
+        adapter = tmp / "adapter.py"
+        adapter.write_text(adapter_body, encoding="utf-8")
+        db = ExperimentDB.default(tmp)
+        with mock.patch.dict(os.environ, {"AHC_ADAPTER_TIMEOUT_SEC": "3"}):
+            result = Autopilot(tmp, "dummy", db).run(
+                budget_sec=None,
+                max_trials=1,
+                agent_count=1,
+                seeds="0-2",
+                adapter_command=f"{sys.executable} {adapter} {{cwd}}",
+                roles=["AnnealingBuilder"],
+            )
+        trial = db.conn.execute(
+            "select * from autopilot_trials where session_id = ?", (result.session_id,)
+        ).fetchone()
+        return db, result, trial, json.loads(trial["summary_json"])
+
+    def test_timed_out_agent_work_is_salvaged_and_evaluated(self) -> None:
+        adapter_body = f"""import pathlib, sys, time
+p = pathlib.Path(sys.argv[1]) / "solver" / "main.cpp"
+p.write_text({ECHO_SOLVER!r}, encoding="utf-8")
+time.sleep(30)
+"""
+        with tempfile.TemporaryDirectory() as tmp_s:
+            tmp = Path(tmp_s)
+            db, result, trial, summary = self._run(tmp, adapter_body)
+            self.assertEqual(trial["decision"], "accepted")
+            self.assertTrue(summary["adapter_timeout"])
+            self.assertEqual(result.merged_count, 1)
+            self.assertEqual(
+                (tmp / "solver" / "main.cpp").read_text(encoding="utf-8"), ECHO_SOLVER
+            )
+
+    def test_timed_out_agent_with_no_change_stays_an_error(self) -> None:
+        adapter_body = """import time
+time.sleep(30)
+"""
+        with tempfile.TemporaryDirectory() as tmp_s:
+            tmp = Path(tmp_s)
+            db, result, trial, summary = self._run(tmp, adapter_body)
+            self.assertEqual(trial["decision"], "error")
+            self.assertEqual(trial["status"], "failed")
+            self.assertIn("adapter failed", summary["error"])
 
 
 class NoveltyUnitTest(unittest.TestCase):

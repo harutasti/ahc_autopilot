@@ -47,6 +47,31 @@ REVIEWERS = {
 }
 
 
+class AdapterFatalError(RuntimeError):
+    """Adapter failure that retrying cannot fix (rate limit, auth, misconfig)."""
+
+
+class AdapterTimeoutError(RuntimeError):
+    """Adapter was killed at the configured timeout; partial work may remain."""
+
+
+# Output patterns whose failures cannot be fixed by retrying the same call.
+_FATAL_ADAPTER_PATTERNS: list[tuple[str, str]] = [
+    ("rate_limit", r"session limit|rate.?limit|usage limit|quota exceeded"),
+    ("auth", r"authentication|unauthorized|invalid.?api.?key|not logged in|credential"),
+    ("config", r"cannot be used with root|unknown option|unrecognized argument|command not found"),
+]
+
+
+def classify_adapter_failure(output: str) -> str | None:
+    """Classify adapter output as a fatal failure kind, or None if retryable."""
+    lowered = output.lower()
+    for kind, pattern in _FATAL_ADAPTER_PATTERNS:
+        if re.search(pattern, lowered):
+            return kind
+    return None
+
+
 @dataclass(frozen=True)
 class AutopilotResult:
     session_id: int
@@ -355,6 +380,12 @@ def parse_roles_file(path: Path, limit: int) -> list[dict[str, str]]:
     return specs
 
 
+def _elapsed_only_rejection(verdict: dict[str, Any]) -> bool:
+    """True when every rejection reason is the max-elapsed gate."""
+    reasons = verdict.get("reasons") or []
+    return bool(reasons) and all(str(r).startswith("max elapsed") for r in reasons)
+
+
 def read_problem_context(root: Path, problem: str, limit: int = 12000) -> str:
     problem_dir = root / "problems" / problem
     parts: list[str] = []
@@ -470,6 +501,7 @@ class Autopilot:
         initial_baseline_run_id = baseline_run_id
         merged_count = 0
         generations_run = 0
+        adapter_fatal = False
         analysis = analyze_run(self.db, baseline_run_id)
         prompt_dir = self.root / "experiments" / "autopilot" / f"session_{session_id}" / "prompts"
         prompt_dir.mkdir(parents=True, exist_ok=True)
@@ -679,16 +711,35 @@ class Autopilot:
                 merged_count += 1
                 merged_this_generation = True
             self._record_insights(generation, outcomes)
+            fatal = next(
+                (o for o in outcomes if (o.summary or {}).get("fatal")), None
+            )
+            if fatal is not None:
+                # The adapter cannot succeed until the operator intervenes
+                # (rate limit, auth, misconfiguration); further generations
+                # would only repeat the failure.
+                adapter_fatal = True
+                self.db.record_agent_message(
+                    session_id,
+                    "Autopilot",
+                    "fatal",
+                    str((fatal.summary or {}).get("error") or "adapter fatal failure"),
+                )
+                break
             if not merge_accepted:
                 break
             if not merged_this_generation:
                 break
+        if adapter_command:
+            status = "adapter_fatal" if adapter_fatal else "completed"
+        else:
+            status = "prompts_generated"
         return AutopilotResult(
             session_id=session_id,
             baseline_run_id=initial_baseline_run_id,
             prompt_dir=prompt_dir,
             selected_agents=all_selected,
-            status="completed" if adapter_command else "prompts_generated",
+            status=status,
             final_baseline_run_id=baseline_run_id,
             merged_count=merged_count,
             generations_run=generations_run,
@@ -848,14 +899,25 @@ class Autopilot:
                 duplicate_info: dict[str, Any] | None = None
                 cascade_info: dict[str, Any] | None = None
                 try:
-                    self._run_adapter(
-                        adapter_command,
-                        active_prompt_path,
-                        candidate_root,
-                        trial_id=trial_id,
-                        log_suffix=log_suffix,
-                    )
+                    start_hash = snapshot_solver_source(candidate_root, store_dir_for(db))
+                    adapter_timeout: str | None = None
+                    try:
+                        self._run_adapter(
+                            adapter_command,
+                            active_prompt_path,
+                            candidate_root,
+                            trial_id=trial_id,
+                            log_suffix=log_suffix,
+                        )
+                    except AdapterTimeoutError as exc:
+                        # Salvage: a timed-out agent may still have left a
+                        # complete-enough candidate in the workspace.
+                        adapter_timeout = str(exc)
                     exact_hash = snapshot_solver_source(candidate_root, store_dir_for(db))
+                    if adapter_timeout is not None and (
+                        exact_hash is None or exact_hash == start_hash
+                    ):
+                        raise RuntimeError(adapter_timeout)
                     norm_hash = (
                         normalized_source_fingerprint(candidate_root / "solver")
                         if exact_hash is not None
@@ -950,6 +1012,15 @@ class Autopilot:
                         comparison = compare_runs(db, baseline_run_id, run_id)
                         verdict = evaluate_acceptance(comparison, policy)
                         decision = verdict["decision"]
+                        remeasure_info: dict[str, Any] | None = None
+                        if decision == "rejected" and _elapsed_only_rejection(verdict):
+                            remeasure_info = self._remeasure_elapsed(
+                                candidate_evaluator, db, run_id, policy
+                            )
+                            if remeasure_info is not None and remeasure_info["passed"]:
+                                comparison = compare_runs(db, baseline_run_id, run_id)
+                                verdict = evaluate_acceptance(comparison, policy)
+                                decision = verdict["decision"]
                         attempts.append(
                             {
                                 "attempt": attempt,
@@ -963,8 +1034,24 @@ class Autopilot:
                         summary = {**comparison, "acceptance": verdict}
                         if cascade_info is not None:
                             summary["cascade"] = cascade_info
+                        if remeasure_info is not None:
+                            summary["timing_remeasure"] = remeasure_info
+                        if adapter_timeout is not None:
+                            summary["adapter_timeout"] = True
                         if decision != "rejected" or attempt == max_attempts:
                             break
+                except AdapterFatalError as exc:
+                    # Retrying the same call cannot succeed; abort this trial
+                    # and let the session react (no repair prompt).
+                    attempts.append(
+                        {
+                            "attempt": attempt,
+                            "decision": "error",
+                            "reasons": [str(exc)],
+                            "fatal": True,
+                        }
+                    )
+                    raise
                 except Exception as exc:
                     error_text = str(exc)
                     attempts.append(
@@ -1016,6 +1103,8 @@ class Autopilot:
             )
         except Exception as exc:
             error_summary: dict[str, Any] = {"error": str(exc)}
+            if isinstance(exc, AdapterFatalError):
+                error_summary["fatal"] = True
             if archive_parent is not None:
                 error_summary["archive_parent"] = archive_parent
             if len(attempts) > 1:
@@ -1036,6 +1125,62 @@ class Autopilot:
             )
         finally:
             db.close()
+
+    def _remeasure_elapsed(
+        self,
+        evaluator: Evaluator,
+        db: ExperimentDB,
+        run_id: int,
+        policy: AcceptancePolicy,
+    ) -> dict[str, Any] | None:
+        """Serially re-measure over-limit seeds before rejecting on elapsed time.
+
+        Parallel trials contend for cores, which inflates the elapsed times of
+        time-budgeted solvers. A candidate whose only gate violation is the
+        elapsed cap gets its over-limit seeds re-run one at a time; the serial
+        measurement is authoritative, so each passing re-run replaces the
+        case row. Returns None when there is nothing to re-measure, else
+        {"passed": bool, "seeds": {seed: elapsed}}.
+        """
+        limit = policy.max_elapsed_sec
+        if limit is None:
+            return None
+        over = [
+            case
+            for case in db.list_cases(run_id)
+            if case["status"] == "ok"
+            and case["score"] is not None
+            and float(case["elapsed_sec"]) > limit
+        ]
+        if not over:
+            return None
+        remeasure_dir = evaluator.root / "experiments" / "remeasure" / f"run_{run_id}"
+        remeasure_dir.mkdir(parents=True, exist_ok=True)
+        seeds: dict[str, float] = {}
+        passed = True
+        for case in over:
+            outcome = evaluator._evaluate_seed(int(case["seed"]), remeasure_dir)
+            seeds[str(outcome.seed)] = outcome.elapsed_sec
+            if (
+                outcome.status != "ok"
+                or outcome.score is None
+                or outcome.elapsed_sec > limit
+            ):
+                passed = False
+                break
+            db.insert_case(
+                run_id=run_id,
+                seed=outcome.seed,
+                score=outcome.score,
+                elapsed_sec=outcome.elapsed_sec,
+                status=outcome.status,
+                input_path=outcome.input_path,
+                output_path=outcome.output_path,
+                stderr_path=outcome.stderr_path,
+                stdout_excerpt=outcome.stdout_excerpt,
+                stderr_excerpt=outcome.stderr_excerpt,
+            )
+        return {"passed": passed, "seeds": seeds}
 
     def _validate_candidate(
         self,
@@ -1196,7 +1341,16 @@ class Autopilot:
         (log_dir / f"{stem}.stdout.txt").write_text(result.stdout, encoding="utf-8")
         (log_dir / f"{stem}.stderr.txt").write_text(result.stderr, encoding="utf-8")
         if result.returncode != 0:
-            raise RuntimeError(
+            message = (
                 f"adapter failed with exit code {result.returncode}; "
                 f"see {log_dir / f'{stem}.stderr.txt'}"
             )
+            fatal_kind = classify_adapter_failure(result.stdout + "\n" + result.stderr)
+            if fatal_kind is not None:
+                detail = " ".join((result.stdout + " " + result.stderr).split())[:300]
+                raise AdapterFatalError(
+                    f"unrecoverable adapter failure ({fatal_kind}): {detail}"
+                )
+            if result.timed_out:
+                raise AdapterTimeoutError(message)
+            raise RuntimeError(message)
