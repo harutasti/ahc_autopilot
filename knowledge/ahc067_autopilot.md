@@ -60,3 +60,10 @@ Auto-generated per generation.
 - repair attempts: 2 (duplicate -> rejected)
 - pruned early: 2 worsening seed(s) exceed the budget of 1
 - agent summary tail: Not essential — I'll just wait for the background task notification.
+
+## 2026-07-08 05:32 g1 ParameterTuner -> rejected
+- mean effective delta -2060.342857142857, confidence 0.105, wins/ties/losses 1/31/3
+- verdict: candidate fails or misses 25 seed(s) the baseline solves; 3 worsening seed(s) exceed the budget of 1
+- repair attempts: 3 (rejected -> duplicate -> rejected)
+- pruned early: 3 worsening seed(s) exceed the budget of 1
+- agent summary tail: ously-tried source in `experiments/sources/` that this candidate is not a duplicate. **Risk:** Low — every phase result is still gated by exact BFS `evaluate()`/`best_t` tracking, so output is monotonically non-decreasing regardless of schedule; only the search trajectory changes. Timing margin is preserved (max observed 1.893s, well under the 2.0s hard limit, same 1.88 final cutoff as baseline).
