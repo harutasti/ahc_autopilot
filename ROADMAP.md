@@ -98,11 +98,15 @@
 
 ## Phase 4+ — 拡張
 
-- [ ] Optuna 統合(`tuning_trials` テーブルは既にあるが未使用)
-- [ ] ビジュアライザ画像のマルチモーダル入力(弱点シードの絵をプロンプトへ)
-- [ ] モデルポートフォリオ / バンディットによる LLM・役割の選択学習
-- [ ] ダッシュボード(世代・系統樹・スコア推移の可視化)
-- [ ] 問題セットアップの自動化(statement 取得 → config/tools 配置)
-- [ ] ALE-Bench 的なメタ評価(過去AHC問題群でのシステム自体の性能測定)
-- [ ] リモート評価(評価をローカルCPUから切り離す)
-- [ ] コンテスト・コパイロットモード(rated 対応の human-in-the-loop UI)
+タスク管理は GitHub Issues に移行した。索引は
+[Tracking issue #13](https://github.com/harutasti/ahc_autopilot/issues/13)、
+運用手順は [docs/RUNBOOK.md](docs/RUNBOOK.md)。
+
+- [ ] Optuna 統合(`tuning_trials` テーブルは既にあるが未使用)→ [#8](https://github.com/harutasti/ahc_autopilot/issues/8) **優先**
+- [ ] ビジュアライザ画像のマルチモーダル入力(弱点シードの絵をプロンプトへ)→ [#9](https://github.com/harutasti/ahc_autopilot/issues/9)
+- [ ] モデルポートフォリオ / バンディットによる LLM・役割の選択学習 → [#10](https://github.com/harutasti/ahc_autopilot/issues/10)
+- [ ] ダッシュボード(世代・系統樹・スコア推移の可視化)→ [#11](https://github.com/harutasti/ahc_autopilot/issues/11)
+- [ ] 問題セットアップの自動化(statement 取得 → config/tools 配置)→ [#12](https://github.com/harutasti/ahc_autopilot/issues/12)
+- [ ] ALE-Bench 的なメタ評価(過去AHC問題群でのシステム自体の性能測定)→ [#12](https://github.com/harutasti/ahc_autopilot/issues/12)
+- [ ] リモート評価(評価をローカルCPUから切り離す)→ [#12](https://github.com/harutasti/ahc_autopilot/issues/12)
+- [ ] コンテスト・コパイロットモード(rated 対応の human-in-the-loop UI)→ [#12](https://github.com/harutasti/ahc_autopilot/issues/12)
