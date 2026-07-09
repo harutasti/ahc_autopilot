@@ -99,6 +99,40 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="how many trials run concurrently per generation (default: all)",
     )
+    p.add_argument(
+        "--repair-attempts",
+        type=int,
+        default=0,
+        help=(
+            "on rejection or failure, feed the gate reasons and numbers back to the "
+            "same workspace agent and retry up to N times per trial (default: 0)"
+        ),
+    )
+    p.add_argument(
+        "--no-novelty-filter",
+        action="store_true",
+        help=(
+            "evaluate candidates even when their source is identical (exactly or up to "
+            "comments/whitespace) to an already-evaluated run"
+        ),
+    )
+    p.add_argument(
+        "--archive",
+        action="store_true",
+        help=(
+            "sample each trial's starting source from the session's lineage archive "
+            "(weighted by fitness and novelty) instead of always branching from the mainline"
+        ),
+    )
+    p.add_argument(
+        "--dynamic-roles",
+        action="store_true",
+        help=(
+            "let an orchestrator LLM (via the adapter) design each generation's roles and "
+            "focus from the analysis; falls back to the static catalog on failure. "
+            "--roles takes precedence"
+        ),
+    )
 
     p = sub.add_parser("source")
     p.add_argument("--run", type=int, required=True)
@@ -183,6 +217,10 @@ def main(argv: list[str] | None = None) -> int:
             generations=args.generations,
             validation_seeds=args.validation_seeds,
             trial_jobs=args.trial_jobs,
+            repair_attempts=args.repair_attempts,
+            novelty_filter=not args.no_novelty_filter,
+            archive_parents=args.archive,
+            dynamic_roles=args.dynamic_roles,
         )
         print(json.dumps({
             "session_id": result.session_id,

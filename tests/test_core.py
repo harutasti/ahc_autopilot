@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import random
 import shutil
@@ -9,14 +10,24 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
-from ahc_lab.agents import Autopilot, build_agent_prompt, select_specialists
+from ahc_lab.agents import (
+    SPECIALISTS,
+    Autopilot,
+    build_agent_prompt,
+    classify_adapter_failure,
+    parse_roles_file,
+    select_specialists,
+)
 from ahc_lab.analysis import analyze_run, compare_runs
+from ahc_lab.archive import build_archive, sample_parents
 from ahc_lab.cli import _init_problem, _parse_roles
 from ahc_lab.config import load_problem_config
 from ahc_lab.db import ExperimentDB
 from ahc_lab.evaluator import Evaluator
 from ahc_lab.knowledge import search_knowledge
+from ahc_lab.novelty import normalize_cpp, normalized_source_fingerprint
 from ahc_lab.policy import AcceptancePolicy, evaluate_acceptance
 from ahc_lab.runner import run_shell
 from ahc_lab.seeds import parse_seed_spec
@@ -65,6 +76,33 @@ int main() {
     if (!(std::cin >> target)) return 0;
     if (target > 500000) return 1;
     std::cout << target << '\\n';
+    return 0;
+}
+"""
+
+ECHO_MINUS_TWENTY_SOLVER = """
+#include <iostream>
+int main() {
+    long long target;
+    if (!(std::cin >> target)) return 0;
+    std::cout << target - 20 << '\\n';
+    return 0;
+}
+"""
+
+BROKEN_SOLVER = """
+#include <iostream>
+int main() { this does not compile
+"""
+
+ECHO_MINUS_TEN_COMMENTED_SOLVER = """
+// cosmetic edit: comments and whitespace only
+#include <iostream>
+/* block comment */
+int main() {
+    long long target;   // read the target
+    if (!(std::cin >> target))    return 0;
+    std::cout << target - 10 << '\\n';
     return 0;
 }
 """
@@ -405,7 +443,10 @@ elif "target - 5" in text:
                     (result.session_id,),
                 )
             ]
-            self.assertEqual(decisions, ["accepted", "accepted", "neutral"])
+            # Generation 3 leaves the solver unchanged, so the novelty filter
+            # skips it as a duplicate of the merged source instead of
+            # re-evaluating it to a neutral verdict.
+            self.assertEqual(decisions, ["accepted", "accepted", "duplicate"])
 
     def test_parallel_trials_merge_best_only(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_s:
@@ -479,6 +520,755 @@ p.write_text({CRASHY_LARGE_TARGET_SOLVER!r}, encoding="utf-8")
                 (tmp / "solver" / "main.cpp").read_text(encoding="utf-8"),
                 ECHO_MINUS_TEN_SOLVER,
             )
+
+
+class AutopilotRepairTest(unittest.TestCase):
+    def _run(self, tmp: Path, adapter_body: str, *, repair_attempts: int, **kwargs):
+        tmp = _make_dummy_root(tmp, ECHO_MINUS_TEN_SOLVER)
+        adapter = tmp / "adapter.py"
+        adapter.write_text(adapter_body, encoding="utf-8")
+        db = ExperimentDB.default(tmp)
+        result = Autopilot(tmp, "dummy", db).run(
+            budget_sec=None,
+            max_trials=1,
+            agent_count=1,
+            seeds=kwargs.pop("seeds", "0-2"),
+            adapter_command=f"{sys.executable} {adapter} {{cwd}}",
+            roles=["AnnealingBuilder"],
+            repair_attempts=repair_attempts,
+            **kwargs,
+        )
+        trial = db.conn.execute(
+            "select * from autopilot_trials where session_id = ?", (result.session_id,)
+        ).fetchone()
+        return db, result, trial, json.loads(trial["summary_json"])
+
+    def test_rejected_candidate_is_repaired_after_feedback(self) -> None:
+        adapter_body = f"""import pathlib, sys
+p = pathlib.Path(sys.argv[1]) / "solver" / "main.cpp"
+if "target - 20" in p.read_text(encoding="utf-8"):
+    p.write_text({ECHO_SOLVER!r}, encoding="utf-8")
+else:
+    p.write_text({ECHO_MINUS_TWENTY_SOLVER!r}, encoding="utf-8")
+"""
+        with tempfile.TemporaryDirectory() as tmp_s:
+            tmp = Path(tmp_s)
+            db, result, trial, summary = self._run(tmp, adapter_body, repair_attempts=1)
+            self.assertEqual(trial["decision"], "accepted")
+            self.assertEqual(result.merged_count, 1)
+            self.assertEqual(
+                (tmp / "solver" / "main.cpp").read_text(encoding="utf-8"), ECHO_SOLVER
+            )
+            attempts = summary["repair"]["attempts"]
+            self.assertEqual([a["decision"] for a in attempts], ["rejected", "accepted"])
+            first_run = db.get_run(attempts[0]["run_id"])
+            second_run = db.get_run(attempts[1]["run_id"])
+            self.assertEqual(first_run["parent_run_id"], result.baseline_run_id)
+            self.assertEqual(second_run["parent_run_id"], attempts[0]["run_id"])
+            repair_prompt = (
+                result.prompt_dir / "g1_candidate_1_AnnealingBuilder_repair1.md"
+            ).read_text(encoding="utf-8")
+            self.assertIn("acceptance gate rejected", repair_prompt)
+            self.assertIn("Measured numbers", repair_prompt)
+            self.assertIn("Original task prompt", repair_prompt)
+            messages = db.conn.execute(
+                "select count(*) as n from agent_messages where role = 'repair_prompt'"
+            ).fetchone()["n"]
+            self.assertEqual(messages, 1)
+            insights = (tmp / "knowledge" / "dummy_autopilot.md").read_text(encoding="utf-8")
+            self.assertIn("repair attempts: 2 (rejected -> accepted)", insights)
+
+    def test_repair_stops_when_agent_makes_no_change(self) -> None:
+        adapter_body = f"""import pathlib, sys
+p = pathlib.Path(sys.argv[1]) / "solver" / "main.cpp"
+p.write_text({ECHO_MINUS_TWENTY_SOLVER!r}, encoding="utf-8")
+"""
+        with tempfile.TemporaryDirectory() as tmp_s:
+            tmp = Path(tmp_s)
+            db, result, trial, summary = self._run(tmp, adapter_body, repair_attempts=3)
+            self.assertEqual(trial["decision"], "rejected")
+            self.assertEqual(result.merged_count, 0)
+            attempts = summary["repair"]["attempts"]
+            # The unchanged repair is detected before evaluation, so the second
+            # attempt is recorded as a duplicate and the trial keeps the
+            # rejected verdict of the first attempt.
+            self.assertEqual([a["decision"] for a in attempts], ["rejected", "duplicate"])
+            self.assertTrue(attempts[1]["no_source_change"])
+            self.assertTrue(
+                (result.prompt_dir / "g1_candidate_1_AnnealingBuilder_repair1.md").exists()
+            )
+            self.assertFalse(
+                (result.prompt_dir / "g1_candidate_1_AnnealingBuilder_repair2.md").exists()
+            )
+
+    def test_failed_attempt_feeds_error_back_and_recovers(self) -> None:
+        adapter_body = f"""import pathlib, sys
+p = pathlib.Path(sys.argv[1]) / "solver" / "main.cpp"
+if "does not compile" in p.read_text(encoding="utf-8"):
+    p.write_text({ECHO_SOLVER!r}, encoding="utf-8")
+else:
+    p.write_text({BROKEN_SOLVER!r}, encoding="utf-8")
+"""
+        with tempfile.TemporaryDirectory() as tmp_s:
+            tmp = Path(tmp_s)
+            db, result, trial, summary = self._run(tmp, adapter_body, repair_attempts=1)
+            self.assertEqual(trial["decision"], "accepted")
+            self.assertEqual(result.merged_count, 1)
+            attempts = summary["repair"]["attempts"]
+            self.assertEqual([a["decision"] for a in attempts], ["error", "accepted"])
+            repair_prompt = (
+                result.prompt_dir / "g1_candidate_1_AnnealingBuilder_repair1.md"
+            ).read_text(encoding="utf-8")
+            self.assertIn("failed before it could be scored", repair_prompt)
+            self.assertIn("build failed", repair_prompt)
+
+    def test_repair_disabled_by_default_keeps_single_attempt(self) -> None:
+        adapter_body = f"""import pathlib, sys
+p = pathlib.Path(sys.argv[1]) / "solver" / "main.cpp"
+p.write_text({ECHO_MINUS_TWENTY_SOLVER!r}, encoding="utf-8")
+"""
+        with tempfile.TemporaryDirectory() as tmp_s:
+            tmp = Path(tmp_s)
+            db, result, trial, summary = self._run(tmp, adapter_body, repair_attempts=0)
+            self.assertEqual(trial["decision"], "rejected")
+            self.assertNotIn("repair", summary)
+            self.assertFalse(
+                (result.prompt_dir / "g1_candidate_1_AnnealingBuilder_repair1.md").exists()
+            )
+
+    def test_pruned_rejection_feedback_notes_unevaluated_seeds(self) -> None:
+        adapter_body = f"""import pathlib, sys
+p = pathlib.Path(sys.argv[1]) / "solver" / "main.cpp"
+if "target - 20" in p.read_text(encoding="utf-8"):
+    p.write_text({ECHO_SOLVER!r}, encoding="utf-8")
+else:
+    p.write_text({ECHO_MINUS_TWENTY_SOLVER!r}, encoding="utf-8")
+"""
+        with tempfile.TemporaryDirectory() as tmp_s:
+            tmp = Path(tmp_s)
+            db, result, trial, summary = self._run(
+                tmp, adapter_body, repair_attempts=1, seeds="0-6"
+            )
+            self.assertEqual(trial["decision"], "accepted")
+            repair_prompt = (
+                result.prompt_dir / "g1_candidate_1_AnnealingBuilder_repair1.md"
+            ).read_text(encoding="utf-8")
+            self.assertIn("pruned early after 5 of 7 seeds", repair_prompt)
+            self.assertIn("were never evaluated because of the pruning", repair_prompt)
+
+    def test_repair_no_change_after_error_fails_trial(self) -> None:
+        adapter_body = f"""import pathlib, sys
+p = pathlib.Path(sys.argv[1]) / "solver" / "main.cpp"
+p.write_text({BROKEN_SOLVER!r}, encoding="utf-8")
+"""
+        with tempfile.TemporaryDirectory() as tmp_s:
+            tmp = Path(tmp_s)
+            db, result, trial, summary = self._run(tmp, adapter_body, repair_attempts=1)
+            self.assertEqual(trial["decision"], "error")
+            self.assertEqual(trial["status"], "failed")
+            attempts = summary["repair"]["attempts"]
+            self.assertEqual([a["decision"] for a in attempts], ["error", "duplicate"])
+            self.assertTrue(attempts[1]["no_source_change"])
+            self.assertIn("build failed", summary["error"])
+
+
+class AdapterFatalTest(unittest.TestCase):
+    def test_classify_adapter_failure(self) -> None:
+        self.assertEqual(
+            classify_adapter_failure("You've hit your session limit · resets 3am (UTC)"),
+            "rate_limit",
+        )
+        self.assertEqual(
+            classify_adapter_failure(
+                "--dangerously-skip-permissions cannot be used with root/sudo privileges"
+            ),
+            "config",
+        )
+        self.assertEqual(classify_adapter_failure("Invalid API key provided"), "auth")
+        self.assertIsNone(classify_adapter_failure("g++: error: main.cpp: No such file"))
+        self.assertIsNone(classify_adapter_failure(""))
+
+    def test_fatal_adapter_failure_skips_repair_and_aborts_session(self) -> None:
+        adapter_body = """import sys
+print("You've hit your session limit · resets 3am (UTC)")
+sys.exit(1)
+"""
+        with tempfile.TemporaryDirectory() as tmp_s:
+            tmp = _make_dummy_root(Path(tmp_s), ECHO_MINUS_TEN_SOLVER)
+            adapter = tmp / "adapter.py"
+            adapter.write_text(adapter_body, encoding="utf-8")
+            db = ExperimentDB.default(tmp)
+            result = Autopilot(tmp, "dummy", db).run(
+                budget_sec=None,
+                max_trials=1,
+                agent_count=1,
+                seeds="0-2",
+                adapter_command=f"{sys.executable} {adapter} {{cwd}}",
+                roles=["AnnealingBuilder"],
+                repair_attempts=3,
+                generations=4,
+            )
+            self.assertEqual(result.status, "adapter_fatal")
+            self.assertEqual(result.generations_run, 1)
+            self.assertEqual(result.merged_count, 0)
+            trial = db.conn.execute(
+                "select * from autopilot_trials where session_id = ?", (result.session_id,)
+            ).fetchone()
+            summary = json.loads(trial["summary_json"])
+            self.assertEqual(trial["decision"], "error")
+            self.assertTrue(summary["fatal"])
+            self.assertIn("rate_limit", summary["error"])
+            # No repair retry happened despite repair_attempts=3.
+            self.assertNotIn("repair", summary)
+            self.assertFalse(
+                (result.prompt_dir / "g1_candidate_1_AnnealingBuilder_repair1.md").exists()
+            )
+            session = db.conn.execute(
+                "select status from autopilot_sessions where id = ?", (result.session_id,)
+            ).fetchone()
+            self.assertEqual(session["status"], "adapter_fatal")
+            fatal_message = db.conn.execute(
+                "select content from agent_messages where agent_name='Autopilot' and role='fatal'"
+            ).fetchone()
+            self.assertIsNotNone(fatal_message)
+
+
+class ElapsedRemeasureTest(unittest.TestCase):
+    def test_noisy_elapsed_is_remeasured_and_overridden(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_s:
+            tmp = _make_dummy_root(Path(tmp_s), ECHO_MINUS_TEN_SOLVER)
+            db = ExperimentDB.default(tmp)
+            base_run = Evaluator(tmp, "dummy", db).evaluate([0, 1, 2], tag="base")
+            (tmp / "solver" / "main.cpp").write_text(ECHO_SOLVER, encoding="utf-8")
+            evaluator = Evaluator(tmp, "dummy", db)
+            cand_run = evaluator.evaluate([0, 1, 2], tag="cand")
+            # Simulate contention noise: one seed's recorded elapsed exceeds
+            # the 2.0s gate even though the solver is instant.
+            db.conn.execute(
+                "update cases set elapsed_sec = 5.0 where run_id = ? and seed = 1",
+                (cand_run,),
+            )
+            db.conn.commit()
+            policy = AcceptancePolicy.from_config(evaluator.config)
+            comparison = compare_runs(db, base_run, cand_run)
+            verdict = evaluate_acceptance(comparison, policy)
+            self.assertEqual(verdict["decision"], "rejected")
+            self.assertTrue(
+                all(str(r).startswith("max elapsed") for r in verdict["reasons"])
+            )
+            info = Autopilot(tmp, "dummy", db)._remeasure_elapsed(
+                evaluator, db, cand_run, policy
+            )
+            self.assertTrue(info["passed"])
+            self.assertEqual(list(info["seeds"]), ["1"])
+            comparison = compare_runs(db, base_run, cand_run)
+            verdict = evaluate_acceptance(comparison, policy)
+            self.assertEqual(verdict["decision"], "accepted")
+
+    def test_remeasure_skips_when_no_seed_is_over_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_s:
+            tmp = _make_dummy_root(Path(tmp_s), ECHO_SOLVER)
+            db = ExperimentDB.default(tmp)
+            evaluator = Evaluator(tmp, "dummy", db)
+            run_id = evaluator.evaluate([0, 1], tag="fast")
+            policy = AcceptancePolicy.from_config(evaluator.config)
+            self.assertIsNone(
+                Autopilot(tmp, "dummy", db)._remeasure_elapsed(
+                    evaluator, db, run_id, policy
+                )
+            )
+
+
+class AdapterTimeoutSalvageTest(unittest.TestCase):
+    def _run(self, tmp: Path, adapter_body: str):
+        tmp = _make_dummy_root(tmp, ECHO_MINUS_TEN_SOLVER)
+        adapter = tmp / "adapter.py"
+        adapter.write_text(adapter_body, encoding="utf-8")
+        db = ExperimentDB.default(tmp)
+        with mock.patch.dict(os.environ, {"AHC_ADAPTER_TIMEOUT_SEC": "3"}):
+            result = Autopilot(tmp, "dummy", db).run(
+                budget_sec=None,
+                max_trials=1,
+                agent_count=1,
+                seeds="0-2",
+                adapter_command=f"{sys.executable} {adapter} {{cwd}}",
+                roles=["AnnealingBuilder"],
+            )
+        trial = db.conn.execute(
+            "select * from autopilot_trials where session_id = ?", (result.session_id,)
+        ).fetchone()
+        return db, result, trial, json.loads(trial["summary_json"])
+
+    def test_timed_out_agent_work_is_salvaged_and_evaluated(self) -> None:
+        adapter_body = f"""import pathlib, sys, time
+p = pathlib.Path(sys.argv[1]) / "solver" / "main.cpp"
+p.write_text({ECHO_SOLVER!r}, encoding="utf-8")
+time.sleep(30)
+"""
+        with tempfile.TemporaryDirectory() as tmp_s:
+            tmp = Path(tmp_s)
+            db, result, trial, summary = self._run(tmp, adapter_body)
+            self.assertEqual(trial["decision"], "accepted")
+            self.assertTrue(summary["adapter_timeout"])
+            self.assertEqual(result.merged_count, 1)
+            self.assertEqual(
+                (tmp / "solver" / "main.cpp").read_text(encoding="utf-8"), ECHO_SOLVER
+            )
+
+    def test_timed_out_agent_with_no_change_stays_an_error(self) -> None:
+        adapter_body = """import time
+time.sleep(30)
+"""
+        with tempfile.TemporaryDirectory() as tmp_s:
+            tmp = Path(tmp_s)
+            db, result, trial, summary = self._run(tmp, adapter_body)
+            self.assertEqual(trial["decision"], "error")
+            self.assertEqual(trial["status"], "failed")
+            self.assertIn("adapter failed", summary["error"])
+
+
+class NoveltyUnitTest(unittest.TestCase):
+    def test_normalize_cpp_strips_comments_and_whitespace(self) -> None:
+        self.assertEqual(
+            normalize_cpp(ECHO_MINUS_TEN_COMMENTED_SOLVER),
+            normalize_cpp(ECHO_MINUS_TEN_SOLVER),
+        )
+
+    def test_normalize_cpp_preserves_string_literals(self) -> None:
+        code = 'const char *url = "http://example.com"; // real comment\n'
+        normalized = normalize_cpp(code)
+        self.assertIn("http://example.com", normalized)
+        self.assertNotIn("real comment", normalized)
+
+    def test_normalize_cpp_block_comment_separates_tokens(self) -> None:
+        self.assertNotEqual(normalize_cpp("int a/*x*/b;"), normalize_cpp("int ab;"))
+
+    def test_normalized_fingerprint_matches_cosmetic_variant_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_s:
+            tmp = Path(tmp_s)
+            for name, source in [
+                ("plain", ECHO_MINUS_TEN_SOLVER),
+                ("commented", ECHO_MINUS_TEN_COMMENTED_SOLVER),
+                ("different", ECHO_SOLVER),
+            ]:
+                (tmp / name).mkdir()
+                (tmp / name / "main.cpp").write_text(source, encoding="utf-8")
+            plain = normalized_source_fingerprint(tmp / "plain")
+            self.assertEqual(plain, normalized_source_fingerprint(tmp / "commented"))
+            self.assertNotEqual(plain, normalized_source_fingerprint(tmp / "different"))
+
+
+class AutopilotNoveltyTest(unittest.TestCase):
+    def _run(self, tmp: Path, adapter_body: str, **kwargs):
+        tmp = _make_dummy_root(tmp, ECHO_MINUS_TEN_SOLVER)
+        adapter = tmp / "adapter.py"
+        adapter.write_text(adapter_body, encoding="utf-8")
+        db = ExperimentDB.default(tmp)
+        result = Autopilot(tmp, "dummy", db).run(
+            budget_sec=None,
+            max_trials=1,
+            agent_count=1,
+            seeds="0-2",
+            adapter_command=f"{sys.executable} {adapter} {{cwd}}",
+            roles=["AnnealingBuilder"],
+            **kwargs,
+        )
+        trial = db.conn.execute(
+            "select * from autopilot_trials where session_id = ?", (result.session_id,)
+        ).fetchone()
+        return db, result, trial, json.loads(trial["summary_json"])
+
+    COSMETIC_ADAPTER = f"""import pathlib, sys
+p = pathlib.Path(sys.argv[1]) / "solver" / "main.cpp"
+p.write_text({ECHO_MINUS_TEN_COMMENTED_SOLVER!r}, encoding="utf-8")
+"""
+
+    def test_cosmetic_duplicate_is_skipped_before_evaluation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_s:
+            tmp = Path(tmp_s)
+            db, result, trial, summary = self._run(tmp, self.COSMETIC_ADAPTER)
+            self.assertEqual(trial["decision"], "duplicate")
+            self.assertEqual(trial["status"], "skipped")
+            self.assertIsNone(trial["new_run_id"])
+            self.assertEqual(summary["duplicate"]["match"], "normalized")
+            self.assertEqual(summary["duplicate"]["run_id"], result.baseline_run_id)
+            candidate_runs = db.conn.execute(
+                "select count(*) as n from runs where run_type = 'candidate'"
+            ).fetchone()["n"]
+            self.assertEqual(candidate_runs, 0)
+
+    def test_duplicate_feedback_leads_to_novel_candidate(self) -> None:
+        adapter_body = f"""import pathlib, sys
+p = pathlib.Path(sys.argv[1]) / "solver" / "main.cpp"
+if "// cosmetic" in p.read_text(encoding="utf-8"):
+    p.write_text({ECHO_SOLVER!r}, encoding="utf-8")
+else:
+    p.write_text({ECHO_MINUS_TEN_COMMENTED_SOLVER!r}, encoding="utf-8")
+"""
+        with tempfile.TemporaryDirectory() as tmp_s:
+            tmp = Path(tmp_s)
+            db, result, trial, summary = self._run(tmp, adapter_body, repair_attempts=1)
+            self.assertEqual(trial["decision"], "accepted")
+            self.assertEqual(result.merged_count, 1)
+            attempts = summary["repair"]["attempts"]
+            self.assertEqual([a["decision"] for a in attempts], ["duplicate", "accepted"])
+            repair_prompt = (
+                result.prompt_dir / "g1_candidate_1_AnnealingBuilder_repair1.md"
+            ).read_text(encoding="utf-8")
+            self.assertIn("not novel", repair_prompt)
+            self.assertIn("comments/whitespace", repair_prompt)
+
+    def test_novelty_filter_can_be_disabled(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_s:
+            tmp = Path(tmp_s)
+            db, result, trial, summary = self._run(
+                tmp, self.COSMETIC_ADAPTER, novelty_filter=False
+            )
+            self.assertNotEqual(trial["decision"], "duplicate")
+            self.assertIsNotNone(trial["new_run_id"])
+
+
+class ArchiveUnitTest(unittest.TestCase):
+    def _add_run(
+        self,
+        db: ExperimentDB,
+        *,
+        tag: str,
+        source_hash: str,
+        scores: list[float],
+        run_type: str = "candidate",
+        case_statuses: dict[int, str] | None = None,
+        parent: int | None = None,
+        status: str = "done",
+    ) -> int:
+        run_id = db.create_run(
+            problem="dummy",
+            tag=tag,
+            run_type=run_type,
+            score_direction="max",
+            solver_path=Path("solver"),
+            build_command="true",
+            source_hash=source_hash,
+            parent_run_id=parent,
+        )
+        for seed, score in enumerate(scores):
+            db.insert_case(
+                run_id=run_id,
+                seed=seed,
+                score=score,
+                elapsed_sec=0.01,
+                status=(case_statuses or {}).get(seed, "ok"),
+                input_path=Path("i"),
+                output_path=Path("o"),
+                stderr_path=Path("e"),
+            )
+        db.finish_run(run_id, status=status)
+        return run_id
+
+    def test_build_archive_filters_and_dedupes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_s:
+            db = ExperimentDB(Path(tmp_s) / "ahc.sqlite3")
+            baseline = self._add_run(
+                db, tag="autopilot_s1_baseline", run_type="baseline",
+                source_hash="hash_a", scores=[10.0, 10.0],
+            )
+            best = self._add_run(
+                db, tag="autopilot_s1_c1", source_hash="hash_b",
+                scores=[20.0, 20.0], parent=baseline,
+            )
+            self._add_run(  # same source again: deduped, earliest kept
+                db, tag="autopilot_s1_c2", source_hash="hash_b", scores=[20.0, 20.0],
+            )
+            self._add_run(  # pruned run: excluded
+                db, tag="autopilot_s1_c3", source_hash="hash_c",
+                scores=[30.0, 30.0], status="pruned",
+            )
+            self._add_run(  # failing case: excluded
+                db, tag="autopilot_s1_c4", source_hash="hash_d",
+                scores=[40.0, 40.0], case_statuses={1: "runtime_error"},
+            )
+            self._add_run(  # validation run type: excluded
+                db, tag="autopilot_s1_v1", run_type="validation",
+                source_hash="hash_e", scores=[50.0, 50.0],
+            )
+            self._add_run(  # other session: excluded
+                db, tag="autopilot_s2_c1", source_hash="hash_f", scores=[60.0, 60.0],
+            )
+            archive = build_archive(db, "dummy", "autopilot_s1_")
+            self.assertEqual(
+                [(e.run_id, e.source_hash) for e in archive],
+                [(baseline, "hash_a"), (best, "hash_b")],
+            )
+            by_id = {e.run_id: e for e in archive}
+            self.assertEqual(by_id[best].fitness, 20.0)
+            self.assertEqual(by_id[baseline].children, 1)
+            self.assertEqual(by_id[best].children, 0)
+            db.close()
+
+    def test_sample_parents_prefers_fit_and_novel(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_s:
+            db = ExperimentDB(Path(tmp_s) / "ahc.sqlite3")
+            weak = self._add_run(
+                db, tag="autopilot_s1_baseline", run_type="baseline",
+                source_hash="hash_a", scores=[10.0],
+            )
+            strong = self._add_run(
+                db, tag="autopilot_s1_c1", source_hash="hash_b", scores=[20.0],
+            )
+            for i in range(4):  # the weak parent is already well explored
+                self._add_run(
+                    db, tag=f"autopilot_s1_child{i}", source_hash=f"hash_child{i}",
+                    scores=[5.0], parent=weak, status="failed",
+                )
+            archive = build_archive(db, "dummy", "autopilot_s1_")
+            rng = random.Random(42)
+            picks = [sample_parents(archive, 1, rng=rng)[0].run_id for _ in range(300)]
+            self.assertGreater(picks.count(strong), picks.count(weak) * 2)
+            db.close()
+
+    def test_sample_parents_distinct_while_archive_allows(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_s:
+            db = ExperimentDB(Path(tmp_s) / "ahc.sqlite3")
+            for i in range(3):
+                self._add_run(
+                    db, tag=f"autopilot_s1_c{i}", source_hash=f"hash_{i}",
+                    scores=[float(i)],
+                )
+            archive = build_archive(db, "dummy", "autopilot_s1_")
+            picked = sample_parents(archive, 3, rng=random.Random(1))
+            self.assertEqual(len({e.run_id for e in picked}), 3)
+            picked_more = sample_parents(archive, 5, rng=random.Random(1))
+            self.assertEqual(len(picked_more), 5)
+            db.close()
+
+
+class AutopilotArchiveTest(unittest.TestCase):
+    def test_first_generation_archive_parent_is_baseline(self) -> None:
+        adapter_body = f"""import pathlib, sys
+p = pathlib.Path(sys.argv[1]) / "solver" / "main.cpp"
+p.write_text({ECHO_SOLVER!r}, encoding="utf-8")
+"""
+        with tempfile.TemporaryDirectory() as tmp_s:
+            tmp = _make_dummy_root(Path(tmp_s), ECHO_MINUS_TEN_SOLVER)
+            adapter = tmp / "adapter.py"
+            adapter.write_text(adapter_body, encoding="utf-8")
+            db = ExperimentDB.default(tmp)
+            result = Autopilot(tmp, "dummy", db).run(
+                budget_sec=None,
+                max_trials=1,
+                agent_count=1,
+                seeds="0-2",
+                adapter_command=f"{sys.executable} {adapter} {{cwd}}",
+                roles=["AnnealingBuilder"],
+                archive_parents=True,
+                archive_rng=random.Random(0),
+            )
+            trial = db.conn.execute(
+                "select * from autopilot_trials where session_id = ?", (result.session_id,)
+            ).fetchone()
+            summary = json.loads(trial["summary_json"])
+            self.assertEqual(trial["decision"], "accepted")
+            self.assertEqual(
+                summary["archive_parent"]["run_id"], result.baseline_run_id
+            )
+            prompt = (result.prompt_dir / "g1_candidate_1_AnnealingBuilder.md").read_text(
+                encoding="utf-8"
+            )
+            self.assertIn("archive parent run", prompt)
+
+    def test_archive_mode_branches_from_sampled_parent(self) -> None:
+        # The adapter only produces the winning candidate when its workspace
+        # starts from the seeded archive parent (echo-5), not the mainline.
+        adapter_body = f"""import pathlib, sys
+p = pathlib.Path(sys.argv[1]) / "solver" / "main.cpp"
+if "target - 5" in p.read_text(encoding="utf-8"):
+    p.write_text({ECHO_SOLVER!r}, encoding="utf-8")
+else:
+    p.write_text({ECHO_MINUS_TWENTY_SOLVER!r}, encoding="utf-8")
+"""
+        with tempfile.TemporaryDirectory() as tmp_s:
+            tmp = _make_dummy_root(Path(tmp_s), ECHO_MINUS_TEN_SOLVER)
+            adapter = tmp / "adapter.py"
+            adapter.write_text(adapter_body, encoding="utf-8")
+            db = ExperimentDB.default(tmp)
+            store = store_dir_for(db)
+            with tempfile.TemporaryDirectory() as seed_s:
+                seed_root = Path(seed_s)
+                (seed_root / "solver").mkdir()
+                (seed_root / "solver" / "main.cpp").write_text(
+                    ECHO_MINUS_FIVE_SOLVER, encoding="utf-8"
+                )
+                seeded_hash = snapshot_solver_source(seed_root, store)
+            seeded_run = db.create_run(
+                problem="dummy",
+                tag="autopilot_s1_seeded",
+                run_type="candidate",
+                score_direction="max",
+                solver_path=Path("solver"),
+                build_command="true",
+                source_hash=seeded_hash,
+            )
+            for seed in range(3):
+                db.insert_case(
+                    run_id=seeded_run,
+                    seed=seed,
+                    score=999_995.0,
+                    elapsed_sec=0.01,
+                    status="ok",
+                    input_path=Path("i"),
+                    output_path=Path("o"),
+                    stderr_path=Path("e"),
+                )
+            db.finish_run(seeded_run, status="done")
+
+            def pick_seeded(archive, count, rng=None):
+                return [next(e for e in archive if e.run_id == seeded_run)] * count
+
+            with mock.patch("ahc_lab.agents.sample_parents", pick_seeded):
+                result = Autopilot(tmp, "dummy", db).run(
+                    budget_sec=None,
+                    max_trials=1,
+                    agent_count=1,
+                    seeds="0-2",
+                    adapter_command=f"{sys.executable} {adapter} {{cwd}}",
+                    roles=["AnnealingBuilder"],
+                    archive_parents=True,
+                )
+            trial = db.conn.execute(
+                "select * from autopilot_trials where session_id = ?", (result.session_id,)
+            ).fetchone()
+            summary = json.loads(trial["summary_json"])
+            self.assertEqual(trial["decision"], "accepted")
+            self.assertEqual(result.merged_count, 1)
+            self.assertEqual(
+                (tmp / "solver" / "main.cpp").read_text(encoding="utf-8"), ECHO_SOLVER
+            )
+            self.assertEqual(summary["archive_parent"]["run_id"], seeded_run)
+            candidate_run = db.get_run(trial["new_run_id"])
+            self.assertEqual(candidate_run["parent_run_id"], seeded_run)
+            prompt = (result.prompt_dir / "g1_candidate_1_AnnealingBuilder.md").read_text(
+                encoding="utf-8"
+            )
+            self.assertIn(f"archive parent run {seeded_run}", prompt)
+
+
+class DynamicRolesTest(unittest.TestCase):
+    def test_parse_roles_file_validates_and_sanitizes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_s:
+            path = Path(tmp_s) / "roles.json"
+            path.write_text(
+                json.dumps(
+                    [
+                        {"role": "Beam Search!", "focus": "widen the beam"},
+                        {"role": "BeamSearch", "focus": "duplicate after sanitize"},
+                        {"role": "NoFocus"},
+                        {"role": "", "focus": "no role name"},
+                        "not a dict",
+                        {"role": "Tuner", "focus": "tune params", "responsibility": "owns params"},
+                        {"role": "OneTooMany", "focus": "over the limit"},
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            specs = parse_roles_file(path, limit=2)
+            self.assertEqual(
+                specs,
+                [
+                    {"role": "BeamSearch", "focus": "widen the beam", "responsibility": ""},
+                    {"role": "Tuner", "focus": "tune params", "responsibility": "owns params"},
+                ],
+            )
+            path.write_text(json.dumps({"not": "a list"}), encoding="utf-8")
+            with self.assertRaises(ValueError):
+                parse_roles_file(path, limit=2)
+            path.write_text(json.dumps([{"role": "X"}]), encoding="utf-8")
+            with self.assertRaises(ValueError):
+                parse_roles_file(path, limit=2)
+
+    def _run(self, tmp: Path, adapter_body: str, **kwargs):
+        tmp = _make_dummy_root(tmp, ECHO_MINUS_TEN_SOLVER)
+        adapter = tmp / "adapter.py"
+        adapter.write_text(adapter_body, encoding="utf-8")
+        db = ExperimentDB.default(tmp)
+        result = Autopilot(tmp, "dummy", db).run(
+            budget_sec=None,
+            max_trials=1,
+            agent_count=1,
+            seeds="0-2",
+            adapter_command=f"{sys.executable} {adapter} {{cwd}} {{prompt}}",
+            dynamic_roles=True,
+            **kwargs,
+        )
+        trial = db.conn.execute(
+            "select * from autopilot_trials where session_id = ?", (result.session_id,)
+        ).fetchone()
+        return db, result, trial
+
+    def test_dynamic_roles_generates_trials_from_orchestrator(self) -> None:
+        adapter_body = f"""import json, pathlib, sys
+cwd = pathlib.Path(sys.argv[1])
+prompt = pathlib.Path(sys.argv[2]).read_text(encoding="utf-8")
+if "roles.json" in prompt:
+    (cwd / "roles.json").write_text(json.dumps([
+        {{"role": "Offset Tuner!", "focus": "tune the output offset constant",
+          "responsibility": "owns the output offset constant"}}
+    ]), encoding="utf-8")
+else:
+    (cwd / "solver" / "main.cpp").write_text({ECHO_SOLVER!r}, encoding="utf-8")
+"""
+        with tempfile.TemporaryDirectory() as tmp_s:
+            tmp = Path(tmp_s)
+            db, result, trial = self._run(tmp, adapter_body, roles=None)
+            self.assertEqual(trial["role"], "OffsetTuner")
+            self.assertEqual(trial["decision"], "accepted")
+            self.assertEqual(result.selected_agents, ["OffsetTuner"])
+            self.assertEqual(result.merged_count, 1)
+            prompt = (result.prompt_dir / "g1_candidate_1_OffsetTuner.md").read_text(
+                encoding="utf-8"
+            )
+            self.assertIn("tune the output offset constant", prompt)
+            self.assertIn("owns the output offset constant", prompt)
+            roles_message = db.conn.execute(
+                "select content from agent_messages where agent_name = 'Orchestrator'"
+                " and role = 'roles'"
+            ).fetchone()
+            self.assertIsNotNone(roles_message)
+            self.assertIn("OffsetTuner", roles_message["content"])
+
+    def test_dynamic_roles_falls_back_on_invalid_output(self) -> None:
+        adapter_body = f"""import json, pathlib, sys
+cwd = pathlib.Path(sys.argv[1])
+prompt = pathlib.Path(sys.argv[2]).read_text(encoding="utf-8")
+if "roles.json" in prompt:
+    (cwd / "roles.json").write_text(json.dumps({{"not": "a list"}}), encoding="utf-8")
+else:
+    (cwd / "solver" / "main.cpp").write_text({ECHO_SOLVER!r}, encoding="utf-8")
+"""
+        with tempfile.TemporaryDirectory() as tmp_s:
+            tmp = Path(tmp_s)
+            db, result, trial = self._run(tmp, adapter_body, roles=None)
+            self.assertIn(trial["role"], SPECIALISTS)  # static catalog fallback
+            self.assertEqual(trial["decision"], "accepted")
+            error_message = db.conn.execute(
+                "select content from agent_messages where agent_name = 'Orchestrator'"
+                " and role = 'error'"
+            ).fetchone()
+            self.assertIsNotNone(error_message)
+            self.assertIn("JSON array", error_message["content"])
+
+    def test_explicit_roles_bypass_orchestrator(self) -> None:
+        adapter_body = f"""import pathlib, sys
+cwd = pathlib.Path(sys.argv[1])
+prompt = pathlib.Path(sys.argv[2]).read_text(encoding="utf-8")
+assert "roles.json" not in prompt, "orchestrator must not run when --roles is given"
+(cwd / "solver" / "main.cpp").write_text({ECHO_SOLVER!r}, encoding="utf-8")
+"""
+        with tempfile.TemporaryDirectory() as tmp_s:
+            tmp = Path(tmp_s)
+            db, result, trial = self._run(tmp, adapter_body, roles=["StateDesignBuilder"])
+            self.assertEqual(trial["role"], "StateDesignBuilder")
+            self.assertEqual(trial["decision"], "accepted")
+            self.assertFalse((result.prompt_dir.parent / "orchestrator").exists())
 
 
 class AcceptanceGateTest(unittest.TestCase):

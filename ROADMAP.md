@@ -45,7 +45,7 @@
 - [x] 停滞検知(マージ0の世代で早期終了)、`--budget` 消化で終了
 - [x] 孤児プロセス根絶(プロセスグループ SIGKILL)
 
-## Phase 3 — 進化的探索と学習ループ 🔶 進行中
+## Phase 3 — 進化的探索と学習ループ ✅ 完了
 
 ### 第1弾 ✅ (`96a9954`, `c2bd7f4`)
 
@@ -56,23 +56,57 @@
 - [x] ツールタイムアウトの設定化(generator/score/adapter)— 実戦セッション15の学び
 - [x] エージェントのワークスペース隔離ルール(root への書き込み事故対策)
 
-### 残り
+### 第2弾 ✅ (`2eae8a1`)
 
-- [ ] **アーカイブ型進化探索**: 常に最新マインラインから出発ではなく、系統樹から
-      fitness + novelty で親をサンプリングして分岐(ShinkaEvolve / island model 相当)
-- [ ] **novelty フィルタ**: 既存候補と実質同一の diff を評価前に棄却
-- [ ] **失敗フィードバック再試行**: 棄却理由・ゲート数値を同じワークスペースの
-      エージェントに返して修正させるループ(セッション15の CutBuilder 誤診で価値実証済み)
-- [ ] **動的役割生成**: 固定の specialist カタログではなく、オーケストレータLLMが
-      分析結果から役割と focus を生成
+- [x] **失敗フィードバック再試行**: 棄却理由・ゲート数値を同じワークスペースの
+      エージェントに返して修正させるループ(セッション15の CutBuilder 誤診で価値実証済み)。
+      `--repair-attempts N` で有効化。ビルド/アダプタ失敗もエラー文を返して再試行、
+      修正でソースが変わらなければ早期打ち切り、試行履歴は summary の `repair.attempts`
+      と insights に記録、各試行 run は `parent_run_id` で系統樹に連鎖。
+
+### 第3弾 ✅ (`1a77eb8`)
+
+- [x] **novelty フィルタ**: 既存候補と実質同一の diff を評価前に棄却。
+      完全一致ハッシュ+コメント/空白を無視した正規化フィンガープリント
+      (`snapshot_norms` にメモ化)の2段判定。重複は評価コストゼロで
+      `duplicate`/`skipped` として記録し、修正ループ有効時は「非新規」の
+      フィードバックを返して別案を促す。索引は世代ごとにスナップショットし、
+      並列トライアル間の非決定的な重複判定を回避。`--no-novelty-filter` で無効化。
+      あわせてカスケード早期打ち切り時の修正プロンプトに「未評価シードは
+      打ち切りによるもの(クラッシュではない)」の注記を追加。
+
+### 第4弾 ✅ (`4e8e1b2`)
+
+- [x] **アーカイブ型進化探索**: 常に最新マインラインから出発ではなく、系統樹から
+      fitness + novelty で親をサンプリングして分岐(ShinkaEvolve / island model 相当)。
+      `--archive` で有効化。セッション内の全評価済み run(ソースハッシュで重複排除、
+      全シード成功のみ)をアーカイブ化し、`(1 + fitness順位) / (1 + 子の数)` の重みで
+      トライアルごとに親を抽選。親スナップショットをワークスペースに復元し、
+      プロンプトには親 run の brief と系統注記を注入。採択ゲートは従来どおり
+      マインライン基準なので、弱い親からの探索でもマージ品質は下がらない。
+      選ばれた親は summary の `archive_parent` と run の `parent_run_id` に記録。
+
+### 第5弾 ✅ (`b612145`)
+
+- [x] **動的役割生成**: 固定の specialist カタログではなく、オーケストレータLLMが
+      分析結果から役割と focus を生成。`--dynamic-roles` で有効化。トライアルと同じ
+      アダプタ経由で呼び出すため追加のAPI設定は不要。オーケストレータはスクラッチ
+      ディレクトリに `roles.json`(role / focus / responsibility)を書き、厳格な検証
+      (役割名サニタイズ、focus必須、件数上限、重複排除)後に各トライアルのプロンプトへ
+      注入。失敗時は固定カタログへフォールバックしてエラーを記録するため、
+      オーケストレータの故障で世代ループは止まらない。`--roles` 明示指定が最優先。
 
 ## Phase 4+ — 拡張
 
-- [ ] Optuna 統合(`tuning_trials` テーブルは既にあるが未使用)
-- [ ] ビジュアライザ画像のマルチモーダル入力(弱点シードの絵をプロンプトへ)
-- [ ] モデルポートフォリオ / バンディットによる LLM・役割の選択学習
-- [ ] ダッシュボード(世代・系統樹・スコア推移の可視化)
-- [ ] 問題セットアップの自動化(statement 取得 → config/tools 配置)
-- [ ] ALE-Bench 的なメタ評価(過去AHC問題群でのシステム自体の性能測定)
-- [ ] リモート評価(評価をローカルCPUから切り離す)
-- [ ] コンテスト・コパイロットモード(rated 対応の human-in-the-loop UI)
+タスク管理は GitHub Issues に移行した。索引は
+[Tracking issue #13](https://github.com/harutasti/ahc_autopilot/issues/13)、
+運用手順は [docs/RUNBOOK.md](docs/RUNBOOK.md)。
+
+- [ ] Optuna 統合(`tuning_trials` テーブルは既にあるが未使用)→ [#8](https://github.com/harutasti/ahc_autopilot/issues/8) **優先**
+- [ ] ビジュアライザ画像のマルチモーダル入力(弱点シードの絵をプロンプトへ)→ [#9](https://github.com/harutasti/ahc_autopilot/issues/9)
+- [ ] モデルポートフォリオ / バンディットによる LLM・役割の選択学習 → [#10](https://github.com/harutasti/ahc_autopilot/issues/10)
+- [ ] ダッシュボード(世代・系統樹・スコア推移の可視化)→ [#11](https://github.com/harutasti/ahc_autopilot/issues/11)
+- [ ] 問題セットアップの自動化(statement 取得 → config/tools 配置)→ [#12](https://github.com/harutasti/ahc_autopilot/issues/12)
+- [ ] ALE-Bench 的なメタ評価(過去AHC問題群でのシステム自体の性能測定)→ [#12](https://github.com/harutasti/ahc_autopilot/issues/12)
+- [ ] リモート評価(評価をローカルCPUから切り離す)→ [#12](https://github.com/harutasti/ahc_autopilot/issues/12)
+- [ ] コンテスト・コパイロットモード(rated 対応の human-in-the-loop UI)→ [#12](https://github.com/harutasti/ahc_autopilot/issues/12)

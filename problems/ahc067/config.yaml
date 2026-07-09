@@ -24,3 +24,10 @@ score_command: python3 {problem_dir}/tools/scorer.py {input} {output}
 # Regex used to extract a numeric score from score_command output.
 # The default expects output like: SCORE: 123456
 score_regex: SCORE:\s*([-+0-9.eE]+)
+
+# Acceptance gate: allow one bounded worsening seed when the mean improvement
+# is statistically confident, so single-seed-tradeoff candidates stay in play.
+acceptance:
+  max_worsening_seeds: 1
+  max_worsening_delta: 150000
+  min_improve_confidence: 0.9

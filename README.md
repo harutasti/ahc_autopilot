@@ -227,6 +227,88 @@ Each generation also feeds the next ones:
   candidates so agents build on accepted changes instead of rediscovering or
   undoing them.
 
+## Repair loop
+
+With `--repair-attempts N`, a rejected candidate is not discarded immediately.
+The gate's verdict — rejection reasons, per-seed numbers (failures, worst
+worsening seeds, deltas, confidence), and elapsed times — is written as a
+repair prompt and fed back to the **same workspace agent**, up to N extra
+attempts per trial. The agent's previous change is still applied, so it can
+fix the diagnosis instead of the hypothesis being retried blind. Attempts that
+fail before scoring (build or adapter errors) are fed back the same way.
+
+The loop stops early when a repair leaves the source unchanged, since the
+verdict cannot change. Each attempt's run chains `parent_run_id` to the
+previous attempt, the attempt history is stored in the trial summary under
+`repair.attempts`, and the repair path (e.g. `rejected -> accepted`) is
+recorded in the insights file.
+
+```bash
+python3 tools/ahc.py autopilot --problem ahc067 --seeds 0-99 \
+  --generations 5 --agents 3 --repair-attempts 1
+```
+
+## Novelty filter
+
+Before a candidate is evaluated, its source is checked against every source
+already evaluated for the problem — both the exact content hash and a
+normalized fingerprint that ignores C++ comments and whitespace. A duplicate
+is skipped without spending any seed evaluations and recorded with decision
+`duplicate` (status `skipped`), including which run it duplicates. With
+`--repair-attempts`, the duplicate match is fed back to the agent ("your
+change is not novel — propose a materially different one") instead of ending
+the trial.
+
+The known-source index is snapshotted once per generation, so parallel trials
+that independently produce the same diff are still both evaluated rather than
+one being nondeterministically skipped. A repair attempt that leaves the
+source effectively unchanged (identical up to comments/whitespace) still stops
+the retry loop immediately. Disable the filter with `--no-novelty-filter`.
+
+## Archive evolution
+
+By default every trial branches from the current mainline. With `--archive`,
+each trial instead samples its **starting source** from the session's lineage
+archive: every fully evaluated baseline/candidate run of the session, one
+entry per distinct source. Sampling weight is `(1 + fitness rank) / (1 +
+children)` — better-scoring sources are preferred, but parents that already
+spawned many branches are discounted so unexplored lineage branches get their
+turn (the adaptive parent sampling idea from ShinkaEvolve/AlphaEvolve).
+
+The sampled parent's snapshot is restored into the trial workspace, the prompt
+briefs the agent on the parent run and notes the lineage, and the candidate's
+`parent_run_id` chains to the parent. The **acceptance gate is unchanged**: a
+candidate must still beat the mainline baseline to merge, so branching from a
+weaker parent can explore differently but never lowers the bar. The chosen
+parent is recorded in the trial summary under `archive_parent`.
+
+```bash
+python3 tools/ahc.py autopilot --problem ahc067 --seeds 0-99 \
+  --generations 8 --agents 3 --archive --repair-attempts 1
+```
+
+## Dynamic roles
+
+By default each generation's trial roles come from a static specialist catalog
+(`select_specialists`). With `--dynamic-roles`, an **orchestrator LLM** —
+invoked through the same adapter command as the trials, so no extra API setup
+— studies the latest analysis, knowledge hits, and recent accepted diffs, and
+designs the roles itself: it writes a `roles.json`
+(`[{"role", "focus", "responsibility"}, ...]`) into a scratch directory, which
+is validated (name sanitizing, focus required, count capped, duplicates
+dropped) before use. Each generated focus and responsibility is injected into
+that trial's agent prompt.
+
+On any failure — adapter error, missing or malformed JSON — the generation
+falls back to the static catalog and the error is recorded in
+`agent_messages`, so a broken orchestrator never stalls the loop. An explicit
+`--roles` list always takes precedence and skips the orchestrator entirely.
+
+```bash
+python3 tools/ahc.py autopilot --problem ahc067 --seeds 0-99 \
+  --generations 8 --agents 3 --dynamic-roles --archive --repair-attempts 1
+```
+
 ## Evaluation performance
 
 Seed evaluation is parallel and cached:
