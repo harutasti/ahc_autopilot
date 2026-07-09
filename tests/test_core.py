@@ -22,7 +22,7 @@ from ahc_lab.agents import (
 )
 from ahc_lab.analysis import analyze_run, compare_runs
 from ahc_lab.archive import build_archive, sample_parents
-from ahc_lab.cli import _init_problem, _parse_roles
+from ahc_lab.cli import _init_problem, _parse_roles, main as cli_main
 from ahc_lab.config import load_problem_config
 from ahc_lab.db import ExperimentDB
 from ahc_lab.evaluator import Evaluator
@@ -37,6 +37,7 @@ from ahc_lab.snapshots import (
     snapshot_solver_source,
     store_dir_for,
 )
+from ahc_lab.tuning import load_param_space, optuna_module, run_tuning
 
 
 ECHO_MINUS_TEN_SOLVER = """
@@ -93,6 +94,19 @@ int main() {
 BROKEN_SOLVER = """
 #include <iostream>
 int main() { this does not compile
+"""
+
+PARAM_OFFSET_SOLVER = """
+#include <cstdlib>
+#include <iostream>
+int main() {
+    long long target;
+    if (!(std::cin >> target)) return 0;
+    const char* env = std::getenv("AHC_PARAM_OFFSET");
+    long long offset = env ? std::atoll(env) : 10;
+    std::cout << target - offset << '\\n';
+    return 0;
+}
 """
 
 ECHO_MINUS_TEN_COMMENTED_SOLVER = """
@@ -670,6 +684,107 @@ p.write_text({BROKEN_SOLVER!r}, encoding="utf-8")
             self.assertEqual([a["decision"] for a in attempts], ["error", "duplicate"])
             self.assertTrue(attempts[1]["no_source_change"])
             self.assertIn("build failed", summary["error"])
+
+
+def _make_tuning_root(tmp: Path) -> Path:
+    root = _make_dummy_root(tmp, PARAM_OFFSET_SOLVER)
+    config = root / "problems" / "dummy" / "config.yaml"
+    config.write_text(
+        config.read_text(encoding="utf-8")
+        + "\ntuning:\n  offset:\n    type: int\n    low: 0\n    high: 10\n",
+        encoding="utf-8",
+    )
+    return root
+
+
+class TuningTest(unittest.TestCase):
+    def test_params_reach_solver_via_env(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_s:
+            tmp = _make_tuning_root(Path(tmp_s))
+            db = ExperimentDB.default(tmp)
+            evaluator = Evaluator(tmp, "dummy", db)
+            default_run = evaluator.evaluate([0, 1], tag="default")
+            self.assertEqual(analyze_run(db, default_run)["mean_score"], 999_990.0)
+            tuned_run = evaluator.evaluate([0, 1], tag="tuned", params={"offset": 3})
+            self.assertEqual(analyze_run(db, tuned_run)["mean_score"], 999_997.0)
+            # Same params hit the (source, seed, params) cache.
+            cached_run = evaluator.evaluate([0, 1], tag="again", params={"offset": 3})
+            reused = db.conn.execute(
+                "select count(*) as n from cases where run_id = ? and source_case_id is not null",
+                (cached_run,),
+            ).fetchone()["n"]
+            self.assertEqual(reused, 2)
+
+    def test_load_param_space_parses_and_validates(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_s:
+            tmp = _make_tuning_root(Path(tmp_s))
+            config = load_problem_config(tmp, "dummy")
+            specs = load_param_space(config)
+            self.assertEqual(len(specs), 1)
+            self.assertEqual((specs[0].name, specs[0].type), ("offset", "int"))
+            self.assertEqual((specs[0].low, specs[0].high), (0.0, 10.0))
+            bad = tmp / "problems" / "dummy" / "config.yaml"
+            bad.write_text(
+                bad.read_text(encoding="utf-8").replace("type: int", "type: mystery"),
+                encoding="utf-8",
+            )
+            with self.assertRaises(ValueError):
+                load_param_space(load_problem_config(tmp, "dummy"))
+
+    def test_random_tuning_finds_best_offset(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_s:
+            tmp = _make_tuning_root(Path(tmp_s))
+            db = ExperimentDB.default(tmp)
+            result = run_tuning(
+                tmp,
+                "dummy",
+                seeds=[0, 1],
+                n_trials=30,
+                db=db,
+                sampler="random",
+                rng=random.Random(7),
+            )
+            self.assertEqual(result["sampler"], "random")
+            self.assertEqual(result["best_params"], {"offset": 0})
+            self.assertEqual(result["best_value"], 1_000_000.0)
+            self.assertEqual(result["baseline_value"], 999_990.0)
+            self.assertTrue(result["improved"])
+            # The 11-value space is exhausted, then sampling stops.
+            self.assertEqual(result["trials_run"], 11)
+            rows = db.conn.execute(
+                "select count(*) as n from tuning_trials where trial_id = 0"
+            ).fetchone()["n"]
+            self.assertEqual(rows, 11)
+            best_file = tmp / "experiments" / "tuning" / "dummy_best.json"
+            self.assertTrue(best_file.exists())
+
+    def test_tune_cli_smoke(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_s:
+            tmp = _make_tuning_root(Path(tmp_s))
+            code = cli_main(
+                [
+                    "--root", str(tmp),
+                    "tune", "--problem", "dummy",
+                    "--seeds", "0-1", "--trials", "3", "--sampler", "random",
+                ]
+            )
+            self.assertEqual(code, 0)
+
+    @unittest.skipUnless(optuna_module() is not None, "optuna not installed")
+    def test_optuna_sampler_runs_when_available(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_s:
+            tmp = _make_tuning_root(Path(tmp_s))
+            result = run_tuning(
+                tmp,
+                "dummy",
+                seeds=[0, 1],
+                n_trials=8,
+                sampler="optuna",
+                rng=random.Random(7),
+            )
+            self.assertEqual(result["sampler"], "optuna-tpe")
+            self.assertIsNotNone(result["best_params"])
+            self.assertGreaterEqual(result["best_value"], 999_990.0)
 
 
 class AdapterFatalTest(unittest.TestCase):

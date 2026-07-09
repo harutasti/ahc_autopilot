@@ -66,6 +66,19 @@ ls experiments/adapter_logs/            # trial_N(.repair系)/orchestrator_* の
   セッションは `adapter_fatal` で終了している
 - `[timing_remeasure]` が summary にあれば経過時間の再計測バルブが発動している
 
+## パラメータチューニング
+
+局所最適でエージェントのアイデアが尽きたら `ahc tune`(詳細は README の
+Parameter tuning 節):
+
+```bash
+# 1) エージェントに定数のパラメータ化を依頼(AHC_PARAM_* を読む、既定値=現定数)
+# 2) config.yaml に tuning: ブロックで探索空間を宣言
+# 3) 探索(optuna があれば TPE、なければランダム)
+python3 tools/ahc.py tune --problem ahc067 --seeds 0-59 --trials 50
+# 4) ベスト設定をエージェントに焼き込ませ、通常の採択ゲートを通す
+```
+
 ## ゲート調整(問題ごと)
 
 `problems/<problem>/config.yaml` の `acceptance:` ブロック。ahc067 は現在

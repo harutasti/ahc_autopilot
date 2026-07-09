@@ -102,7 +102,10 @@
 [Tracking issue #13](https://github.com/harutasti/ahc_autopilot/issues/13)、
 運用手順は [docs/RUNBOOK.md](docs/RUNBOOK.md)。
 
-- [ ] Optuna 統合(`tuning_trials` テーブルは既にあるが未使用)→ [#8](https://github.com/harutasti/ahc_autopilot/issues/8) **優先**
+- [x] Optuna 統合 → [#8](https://github.com/harutasti/ahc_autopilot/issues/8) ✅
+      `ahc tune`: config の `tuning:` ブロックで探索空間を宣言、`AHC_PARAM_*` 環境変数で
+      solver に注入、Optuna TPE(未導入時は組み込みランダム探索)で探索し
+      `tuning_trials` に記録。評価は通常の evaluator 経由(キャッシュ・並列有効)。
 - [ ] ビジュアライザ画像のマルチモーダル入力(弱点シードの絵をプロンプトへ)→ [#9](https://github.com/harutasti/ahc_autopilot/issues/9)
 - [ ] モデルポートフォリオ / バンディットによる LLM・役割の選択学習 → [#10](https://github.com/harutasti/ahc_autopilot/issues/10)
 - [ ] ダッシュボード(世代・系統樹・スコア推移の可視化)→ [#11](https://github.com/harutasti/ahc_autopilot/issues/11)

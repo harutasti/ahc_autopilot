@@ -9,6 +9,9 @@ description = "Autonomous multi-agent AtCoder Heuristic Contest improvement lab"
 requires-python = ">=3.11"
 dependencies = []
 
+[project.optional-dependencies]
+tuning = ["optuna>=3.0"]
+
 [project.scripts]
 ahc = "ahc_lab.cli:main"
 ahc-mcp = "ahc_lab.mcp_server:main"
