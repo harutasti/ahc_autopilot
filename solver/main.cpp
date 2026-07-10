@@ -439,8 +439,8 @@ struct AHC067Solver {
         }
         if (current.empty() || candidates.empty()) return best;
 
-        static const double START_TEMP = param_double("AHC_PARAM_START_TEMP", 5.0);
-        static const double END_TEMP = param_double("AHC_PARAM_END_TEMP", 0.30);
+        static const double START_TEMP = param_double("AHC_PARAM_START_TEMP", 6.235);
+        static const double END_TEMP = param_double("AHC_PARAM_END_TEMP", 0.823);
 
         bool improved = true;
         while (improved && timer.elapsed() < hillclimb_limit) {
@@ -611,15 +611,15 @@ struct AHC067Solver {
 
     vector<Gate> solve(int &baseline_t, int &best_t, int &candidate_count, int &iterations, int &accepted) {
         Timer timer(1.90);
-        const double t_hill1 = param_double("AHC_PARAM_T_HILL1", 0.45);
-        const double t_anneal1 = param_double("AHC_PARAM_T_ANNEAL1", 0.70);
-        const double t_hill2 = param_double("AHC_PARAM_T_HILL2", 0.85);
-        const double t_anneal2 = param_double("AHC_PARAM_T_ANNEAL2", 1.55);
-        const double t_single = param_double("AHC_PARAM_T_SINGLE", 1.60);
-        const double t_composite = param_double("AHC_PARAM_T_COMPOSITE", 1.78);
-        const int bridge_cap2 = param_int("AHC_PARAM_BRIDGE_CAP2", 240);
-        const int layer_cap = param_int("AHC_PARAM_LAYER_CAP", 96);
-        const int combined_cap = param_int("AHC_PARAM_COMBINED_CAP", 260);
+        const double t_hill1 = param_double("AHC_PARAM_T_HILL1", 0.555);
+        const double t_anneal1 = param_double("AHC_PARAM_T_ANNEAL1", 0.872);
+        const double t_hill2 = param_double("AHC_PARAM_T_HILL2", 1.073);
+        const double t_anneal2 = param_double("AHC_PARAM_T_ANNEAL2", 1.567);
+        const double t_single = param_double("AHC_PARAM_T_SINGLE", 1.511);
+        const double t_composite = param_double("AHC_PARAM_T_COMPOSITE", 1.676);
+        const int bridge_cap2 = param_int("AHC_PARAM_BRIDGE_CAP2", 129);
+        const int layer_cap = param_int("AHC_PARAM_LAYER_CAP", 188);
+        const int combined_cap = param_int("AHC_PARAM_COMBINED_CAP", 379);
         vector<Candidate> core_candidates = make_bridge_candidates(4, 180);
         candidate_count = static_cast<int>(core_candidates.size());
         vector<Gate> empty;
