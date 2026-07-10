@@ -31,3 +31,53 @@ acceptance:
   max_worsening_seeds: 1
   max_worsening_delta: 150000
   min_improve_confidence: 0.9
+
+# Parameter search space for `ahc tune` (see README: Parameter tuning).
+# Solver reads these as AHC_PARAM_<NAME>; defaults equal shipped constants.
+tuning:
+  t_hill1:
+    type: float
+    low: 0.2
+    high: 0.6
+  t_anneal1:
+    type: float
+    low: 0.5
+    high: 0.9
+  t_hill2:
+    type: float
+    low: 0.7
+    high: 1.15
+  t_anneal2:
+    type: float
+    low: 1.2
+    high: 1.65
+  t_single:
+    type: float
+    low: 1.45
+    high: 1.7
+  t_composite:
+    type: float
+    low: 1.62
+    high: 1.85
+  start_temp:
+    type: float
+    low: 1.0
+    high: 12.0
+    log: true
+  end_temp:
+    type: float
+    low: 0.05
+    high: 1.0
+    log: true
+  bridge_cap2:
+    type: int
+    low: 120
+    high: 400
+  layer_cap:
+    type: int
+    low: 48
+    high: 192
+  combined_cap:
+    type: int
+    low: 150
+    high: 400
