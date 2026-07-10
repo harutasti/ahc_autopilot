@@ -3,6 +3,7 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <deque>
 #include <iostream>
 #include <numeric>
@@ -11,6 +12,19 @@
 #include <string>
 #include <vector>
 using namespace std;
+
+// Tunable constants: overridable via AHC_PARAM_* environment variables (the
+// `ahc tune` contract). Defaults are the shipped values, so behavior without
+// the variables is unchanged; hardcode winners before submitting to AtCoder.
+static double param_double(const char *name, double fallback) {
+    const char *env = getenv(name);
+    return env ? atof(env) : fallback;
+}
+
+static int param_int(const char *name, int fallback) {
+    const char *env = getenv(name);
+    return env ? atoi(env) : fallback;
+}
 
 struct Timer {
     chrono::steady_clock::time_point start;
@@ -425,8 +439,8 @@ struct AHC067Solver {
         }
         if (current.empty() || candidates.empty()) return best;
 
-        constexpr double START_TEMP = 5.0;
-        constexpr double END_TEMP = 0.30;
+        static const double START_TEMP = param_double("AHC_PARAM_START_TEMP", 6.235);
+        static const double END_TEMP = param_double("AHC_PARAM_END_TEMP", 0.823);
 
         bool improved = true;
         while (improved && timer.elapsed() < hillclimb_limit) {
@@ -597,6 +611,15 @@ struct AHC067Solver {
 
     vector<Gate> solve(int &baseline_t, int &best_t, int &candidate_count, int &iterations, int &accepted) {
         Timer timer(1.90);
+        const double t_hill1 = param_double("AHC_PARAM_T_HILL1", 0.555);
+        const double t_anneal1 = param_double("AHC_PARAM_T_ANNEAL1", 0.872);
+        const double t_hill2 = param_double("AHC_PARAM_T_HILL2", 1.073);
+        const double t_anneal2 = param_double("AHC_PARAM_T_ANNEAL2", 1.567);
+        const double t_single = param_double("AHC_PARAM_T_SINGLE", 1.511);
+        const double t_composite = param_double("AHC_PARAM_T_COMPOSITE", 1.676);
+        const int bridge_cap2 = param_int("AHC_PARAM_BRIDGE_CAP2", 129);
+        const int layer_cap = param_int("AHC_PARAM_LAYER_CAP", 188);
+        const int combined_cap = param_int("AHC_PARAM_COMBINED_CAP", 379);
         vector<Candidate> core_candidates = make_bridge_candidates(4, 180);
         candidate_count = static_cast<int>(core_candidates.size());
         vector<Gate> empty;
@@ -609,19 +632,19 @@ struct AHC067Solver {
         if (!core_candidates.empty()) {
             solution = construct(core_candidates, best_t);
             if (!solution.empty()) {
-                solution = improve(solution, core_candidates, best_t, timer, best_t, iterations, accepted, 0.45, 0.70);
+                solution = improve(solution, core_candidates, best_t, timer, best_t, iterations, accepted, t_hill1, t_anneal1);
 
-                broad_candidates = make_bridge_candidates(6, 240);
+                broad_candidates = make_bridge_candidates(6, bridge_cap2);
                 candidate_count = max(candidate_count, static_cast<int>(broad_candidates.size()));
-                solution = improve(solution, broad_candidates, best_t, timer, best_t, iterations, accepted, 0.85, 1.55);
+                solution = improve(solution, broad_candidates, best_t, timer, best_t, iterations, accepted, t_hill2, t_anneal2);
             }
         }
 
-        vector<Candidate> layer_candidates = make_layer_cut_candidates(4, 96);
+        vector<Candidate> layer_candidates = make_layer_cut_candidates(4, layer_cap);
         candidate_count = max(candidate_count, static_cast<int>(broad_candidates.size() + layer_candidates.size()));
         if (layer_candidates.empty()) return solution;
 
-        vector<Gate> layer_single = best_single_candidate(layer_candidates, timer, 1.60, best_t, iterations);
+        vector<Gate> layer_single = best_single_candidate(layer_candidates, timer, t_single, best_t, iterations);
         if (!layer_single.empty()) {
             solution = layer_single;
         }
@@ -630,9 +653,9 @@ struct AHC067Solver {
         // whichever gate type helps most at each remaining switch slot.
         vector<Candidate> combined_candidates = broad_candidates;
         combined_candidates.insert(combined_candidates.end(), layer_candidates.begin(), layer_candidates.end());
-        sort_and_trim_candidates(combined_candidates, 260);
+        sort_and_trim_candidates(combined_candidates, combined_cap);
 
-        vector<Gate> composite = composite_layer_search(solution, combined_candidates, timer, 1.78,
+        vector<Gate> composite = composite_layer_search(solution, combined_candidates, timer, t_composite,
                                                         best_t, iterations);
         if (!composite.empty()) {
             solution = composite;
@@ -642,7 +665,7 @@ struct AHC067Solver {
         // swap-based hillclimb/anneal over the combined pool, instead of
         // leaving it unused.
         solution = improve(solution, combined_candidates, best_t, timer, best_t, iterations, accepted,
-                           1.78, 1.88);
+                           t_composite, 1.88);
         return solution;
     }
 
