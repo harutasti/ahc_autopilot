@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
@@ -40,6 +41,10 @@ class CaseOutcome:
 
 def default_jobs() -> int:
     return max(1, (os.cpu_count() or 2) - 1)
+
+
+def _env_name(key: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_]", "_", str(key)).upper()
 
 
 def split_stages(seeds: list[int], stage_sizes: tuple[int, ...]) -> list[list[int]]:
@@ -123,6 +128,7 @@ class Evaluator:
             use_cache=use_cache,
             source_hash=source_hash,
             params_json=params_json,
+            params=params,
         )
         self.db.finish_run(run_id, status="done" if all_ok else "failed")
         return run_id
@@ -170,6 +176,7 @@ class Evaluator:
                 use_cache=use_cache,
                 source_hash=source_hash,
                 params_json=params_json,
+                params=params,
             )
             all_ok = all_ok and batch_ok
             executed += len(stage_seeds)
@@ -227,6 +234,7 @@ class Evaluator:
         use_cache: bool,
         source_hash: str | None,
         params_json: str,
+        params: dict[str, Any] | None = None,
     ) -> bool:
         """Evaluate seeds in parallel; only this (main) thread touches the DB."""
         all_ok = True
@@ -262,7 +270,9 @@ class Evaluator:
             return all_ok
         worker_count = max(1, jobs if jobs is not None else default_jobs())
         with ThreadPoolExecutor(max_workers=worker_count) as pool:
-            futures = [pool.submit(self._evaluate_seed, seed, run_dir) for seed in pending]
+            futures = [
+                pool.submit(self._evaluate_seed, seed, run_dir, params) for seed in pending
+            ]
             for future in as_completed(futures):
                 outcome = future.result()
                 self.db.insert_case(
@@ -281,7 +291,9 @@ class Evaluator:
                     all_ok = False
         return all_ok
 
-    def _evaluate_seed(self, seed: int, run_dir: Path) -> CaseOutcome:
+    def _evaluate_seed(
+        self, seed: int, run_dir: Path, params: dict[str, Any] | None = None
+    ) -> CaseOutcome:
         case_dir = run_dir / f"seed_{seed}"
         case_dir.mkdir(parents=True, exist_ok=True)
         input_path = case_dir / "input.txt"
@@ -311,6 +323,14 @@ class Evaluator:
         run_cmd = self.config.run_command.format(
             **self._vars(seed=seed, run_dir=run_dir, input_path=input_path, output_path=output_path)
         )
+        if params:
+            # Parameters reach the solver as AHC_PARAM_<NAME> environment
+            # variables, so tuning needs no source change beyond reading them.
+            assignments = " ".join(
+                f"AHC_PARAM_{_env_name(key)}={shlex.quote(str(value))}"
+                for key, value in sorted(params.items())
+            )
+            run_cmd = f"env {assignments} {run_cmd}"
         solved = run_shell(run_cmd, self.root, timeout=self.config.time_limit_sec + 1.0)
         stdout_text += solved.stdout
         stderr_text += solved.stderr

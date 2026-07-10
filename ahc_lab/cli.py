@@ -16,6 +16,7 @@ from .mcp_server import run_server_cli
 from .policy import AcceptancePolicy, evaluate_acceptance
 from .seeds import parse_seed_spec
 from .snapshots import restore_solver_source, snapshot_solver_source, store_dir_for
+from .tuning import run_tuning
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -134,6 +135,19 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
 
+    p = sub.add_parser("tune")
+    p.add_argument("--problem", required=True)
+    p.add_argument("--seeds", default="0-29")
+    p.add_argument("--trials", type=int, default=30, help="parameter settings to evaluate")
+    p.add_argument(
+        "--sampler",
+        choices=["auto", "optuna", "random"],
+        default="auto",
+        help="auto uses Optuna TPE when installed, else built-in random search",
+    )
+    p.add_argument("--jobs", type=int, default=None, help="parallel seed workers per evaluation")
+    p.add_argument("--no-cache", action="store_true")
+
     p = sub.add_parser("source")
     p.add_argument("--run", type=int, required=True)
     p.add_argument(
@@ -232,6 +246,19 @@ def main(argv: list[str] | None = None) -> int:
             "merged_count": result.merged_count,
             "generations_run": result.generations_run,
         }, indent=2))
+        return 0
+    if args.cmd == "tune":
+        result = run_tuning(
+            root,
+            args.problem,
+            seeds=parse_seed_spec(args.seeds),
+            n_trials=args.trials,
+            db=db,
+            sampler=args.sampler,
+            jobs=args.jobs,
+            use_cache=not args.no_cache,
+        )
+        print(json.dumps(result, indent=2, sort_keys=True))
         return 0
     if args.cmd == "source":
         run = db.get_run(args.run)

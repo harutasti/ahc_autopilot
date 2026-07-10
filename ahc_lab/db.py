@@ -441,6 +441,35 @@ class ExperimentDB:
         )
         self.conn.commit()
 
+    def record_tuning_trial(
+        self,
+        *,
+        autopilot_trial_id: int | None,
+        params: dict[str, Any],
+        score: float | None,
+        status: str,
+    ) -> int:
+        """Record one parameter-tuning evaluation.
+
+        `trial_id` 0 marks standalone `ahc tune` runs (the column predates
+        nullable support); autopilot-driven tuning passes its trial id.
+        """
+        cur = self.conn.execute(
+            """
+            insert into tuning_trials (trial_id, params_json, score, status, created_at)
+            values (?, ?, ?, ?, ?)
+            """,
+            (
+                int(autopilot_trial_id or 0),
+                json.dumps(params, sort_keys=True),
+                score,
+                status,
+                time.time(),
+            ),
+        )
+        self.conn.commit()
+        return int(cur.lastrowid)
+
     def record_patch(
         self,
         *,

@@ -309,6 +309,56 @@ python3 tools/ahc.py autopilot --problem ahc067 --seeds 0-99 \
   --generations 8 --agents 3 --dynamic-roles --archive --repair-attempts 1
 ```
 
+## Parameter tuning
+
+`ahc tune` searches a solver's parameter space systematically instead of an
+agent hand-picking a few settings. Parameters reach the solver as
+`AHC_PARAM_<NAME>` environment variables (prefixed onto `run_command`), so the
+solver opts in by reading them with its current constants as defaults:
+
+```cpp
+const char* env = std::getenv("AHC_PARAM_T_HILL_END");
+double t_hill_end = env ? std::atof(env) : 0.70;  // default = current constant
+```
+
+Declare the search space in the problem's `config.yaml`:
+
+```yaml
+tuning:
+  t_hill_end:
+    type: float
+    low: 0.4
+    high: 0.9
+  beam_width:
+    type: int
+    low: 4
+    high: 64
+  strategy:
+    type: categorical
+    choices: greedy|anneal
+```
+
+Then run:
+
+```bash
+python3 tools/ahc.py tune --problem ahc067 --seeds 0-59 --trials 50
+```
+
+Every setting is evaluated through the normal evaluator — runs, the
+`(source, seed, params)` cache, and `tuning_trials` records all apply — and
+the objective is the mean score over the seeds (settings with any failing
+seed are discarded). A defaults run is evaluated first as the reference; the
+result (best params, best/baseline values, run ids) is printed and written to
+`experiments/tuning/<problem>_best.json`.
+
+With [Optuna](https://optuna.org) installed (`pip install .[tuning]`), the
+search uses TPE; without it, a built-in random search runs — so the tool
+works with zero dependencies. The intended loop with autopilot: an agent
+parameterizes the constants (reading `AHC_PARAM_*` with current defaults, a
+no-op change that passes the gate as score-neutral), `ahc tune` finds the
+best setting, and an agent bakes the winners in as a normal candidate that
+must pass the acceptance gate.
+
 ## Evaluation performance
 
 Seed evaluation is parallel and cached:
