@@ -83,3 +83,8 @@ Auto-generated per generation.
 - verdict: mean effective delta 856352.6 is positive with 26 win(s), 0 loss(es)
 - repair attempts: 2 (rejected -> accepted)
 - agent summary tail: 4 ties, 0 losses**, worst-case delta 0 (well under the 150,000 budget and 1-seed limit). - Max elapsed time across all seeds: 1.900s, safely under the 2.0s gate limit (unchanged from before — the extra variants are cheap deterministic BFS/DFS, not RNG-timer-bound). The candidate is now a strict improvement over the accepted mainline with zero worsening seeds. File changed: `solver/main.cpp` only.
+
+## 2026-07-13 09:31 g2 StateDesignBuilder -> accepted
+- mean effective delta 391476.73333333334, confidence 1.0, wins/ties/losses 17/13/0
+- verdict: mean effective delta 391476.73333333334 is positive with 17 win(s), 0 loss(es)
+- agent summary tail: ovably optimal given its pocket pool); closing that gap further would need a different pocket-composition strategy (e.g., directional shell growth away from start rather than whole-graph-distance balls, or multiple independent chains) — noted in knowledge for the next iteration rather than attempted here, since further cut_cap/seed_cap sweeps showed no more low-risk gains available in this design.

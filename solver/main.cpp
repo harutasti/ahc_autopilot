@@ -592,9 +592,32 @@ struct AHC067Solver {
     // earlier pocket, keeping every shell found before that point. A
     // region is only accepted when start and goal stay connected with the
     // ENTIRE region removed, so the manufactured pocket is a genuine
-    // optional detour, never load-bearing for base connectivity.
+    // optional detour, never load-bearing for base connectivity. Width/
+    // collision growth and depth acceptance are two independent limits: a
+    // core picked purely by distance-from-start can grow a wide-enough
+    // ball that wraps around and straddles a cut vertex load-bearing for
+    // the rest of the maze well before it runs out of width budget, so a
+    // single prunability test at the deepest ball reached (recover_shallower
+    // =false, the original behavior) throws away the whole core whenever
+    // that deepest ball is the one that overreaches, even though a
+    // shallower ball from the SAME core -- still deeper than most natural
+    // pockets -- would have been perfectly valid (observed to reject ~90%
+    // of width-feasible candidates on pocket-scarce mazes this way).
+    // recover_shallower=true retries progressively shallower balls from the
+    // same core before giving up on it. This is NOT a strict improvement,
+    // though: consuming a core's cells at a recovered shallow depth can
+    // preempt a DIFFERENT, better-fitting core later in the (dist-from-
+    // start-sorted) seed order that the plain skip-and-move-on behavior
+    // would have left room for -- greedy consumption is order-sensitive, so
+    // more local success does not imply a better global pocket pool. The
+    // caller (build_binary_counter_plan / main) must therefore keep BOTH
+    // recover_shallower variants in its candidate pool and pick whichever
+    // verifies higher, same discipline as require_tree and
+    // manufactured_first above, rather than replacing the old behavior
+    // outright.
     vector<Pocket> find_cut_pockets(int cut_cap, int max_levels, vector<char> &consumed,
-                                    vector<char> &used_edge) const {
+                                    vector<char> &used_edge, bool recover_shallower,
+                                    bool wide_seed_cap) const {
         vector<Pocket> result;
         vector<int> dist_start = bfs_cell(start_id);
         vector<int> seeds;
@@ -603,7 +626,18 @@ struct AHC067Solver {
             seeds.push_back(c);
         }
         sort(seeds.begin(), seeds.end(), [&](int a, int b) { return dist_start[a] > dist_start[b]; });
-        int seed_cap = min(static_cast<int>(seeds.size()), 90);
+        // Every candidate core is cheap (one more BFS over <=400 cells), so
+        // trying more cores than the first 90 by distance-from-start costs
+        // only microseconds but lets scarce-pocket mazes reach cores a
+        // tighter head cut would miss entirely. This is NOT simply "more is
+        // better", though (measured directly): which cores succeed and in
+        // what order determines what gets marked consumed, so scanning more
+        // seeds can make an EARLIER core grab cells a later, better-fitting
+        // core in the ORIGINAL 90-cap order would have used instead --
+        // several seeds got noticeably worse when the cap was raised
+        // unconditionally. wide_seed_cap is therefore a separate candidate
+        // dimension, like recover_shallower, not a replacement default.
+        int seed_cap = min(static_cast<int>(seeds.size()), wide_seed_cap ? 400 : 90);
 
         for (int si = 0; si < seed_cap; si++) {
             int core = seeds[si];
@@ -638,17 +672,33 @@ struct AHC067Solver {
             }
             if (usable_levels < 1) continue;
 
-            vector<char> region(cells.size(), 0);
-            bool bad = false;
-            for (int c = 0; c < static_cast<int>(cells.size()); c++) {
-                if (dist_core[c] < 0 || dist_core[c] > usable_levels - 1) continue;
-                if (c == start_id || c == goal_id || consumed[c]) {
-                    bad = true;
-                    break;
+            // Test prunability starting at the deepest depth reached by
+            // shell growth; when recover_shallower is set, keep retrying
+            // progressively shallower balls from this same core instead of
+            // giving up after the first failure (see class comment above).
+            int chosen_levels = 0;
+            vector<char> region;
+            for (int lv = usable_levels; lv >= 1; lv--) {
+                vector<char> cand_region(cells.size(), 0);
+                bool bad = false;
+                for (int c = 0; c < static_cast<int>(cells.size()); c++) {
+                    if (dist_core[c] < 0 || dist_core[c] > lv - 1) continue;
+                    if (c == start_id || c == goal_id || consumed[c]) {
+                        bad = true;
+                        break;
+                    }
+                    cand_region[c] = 1;
                 }
-                region[c] = 1;
+                if (bad || !region_is_prunable(cand_region)) {
+                    if (!recover_shallower) break;
+                    continue;
+                }
+                chosen_levels = lv;
+                region = std::move(cand_region);
+                break;
             }
-            if (bad || !region_is_prunable(region)) continue;
+            if (chosen_levels < 1) continue;
+            usable_levels = chosen_levels;
 
             Pocket p;
             for (int j = 1; j <= usable_levels; j++) {
@@ -720,8 +770,13 @@ struct AHC067Solver {
     // manufactured in is what raises the floor. Neither pool dominates, so
     // the caller builds both and keeps whichever verifies higher -- same
     // discipline as require_tree and manufactured_first above.
+    //
+    // recover_shallower and wide_seed_cap are forwarded to find_cut_pockets
+    // (only meaningful when use_manufactured is set): see its comments for
+    // why both are pool-composition tradeoffs, not strict wins, and must
+    // stay separate candidates rather than replacing the original behavior.
     Plan build_binary_counter_plan(int &result_t, bool require_tree, bool manufactured_first,
-                                    bool use_manufactured) {
+                                    bool use_manufactured, bool recover_shallower, bool wide_seed_cap) {
         Plan plan;
         result_t = -1;
 
@@ -776,11 +831,11 @@ struct AHC067Solver {
         if (!use_manufactured) {
             pockets = find_pockets(require_tree, consumed, used_edge);
         } else if (manufactured_first) {
-            manufactured = find_cut_pockets(6, k - 1, consumed, used_edge);
+            manufactured = find_cut_pockets(6, k - 1, consumed, used_edge, recover_shallower, wide_seed_cap);
             pockets = find_pockets(require_tree, consumed, used_edge);
         } else {
             pockets = find_pockets(require_tree, consumed, used_edge);
-            manufactured = find_cut_pockets(6, k - 1, consumed, used_edge);
+            manufactured = find_cut_pockets(6, k - 1, consumed, used_edge, recover_shallower, wide_seed_cap);
         }
         pockets.insert(pockets.end(), manufactured.begin(), manufactured.end());
         if (pockets.empty()) return plan;
@@ -1212,34 +1267,50 @@ int main() {
         // dead-end-pocket gadget that can force order-of-magnitude more
         // forced corridor round trips than the additive gate portfolio
         // above, when the maze has enough dead-end structure for it. Built
-        // in up to six variants -- require_tree x {natural-only,
-        // manufactured_first, manufactured_last} -- since none dominates
-        // the other across mazes: require_tree=true is immune to a cyclic
-        // pocket collapsing its own chain but shrinks the natural pool;
-        // merging manufactured pockets in raises the floor on mazes where
-        // natural pockets are scarce, but on mazes where natural pockets
-        // already cover the length ladder well, a manufactured pocket can
-        // still steal a slot the greedy assignment would otherwise give a
-        // cheaper natural one (same level count, picked by insertion
-        // order) or exhaust the M door budget earlier, capping L below
-        // what natural-only reaches -- so natural-only must stay in the
-        // candidate pool, not just be a special case of the merged pool.
-        // All variants are exact-BFS verified and only the
-        // strictly-better-than-portfolio result (if any) is used, so
-        // output quality never regresses; unreachable (-1) or
-        // absent-structure (empty plan, best_t stays -1) results are
-        // naturally rejected by the comparison.
+        // in up to ten variants -- require_tree x {natural-only,
+        // manufactured_first, manufactured_last} x recover_shallower --
+        // since none dominates the other across mazes: require_tree=true is
+        // immune to a cyclic pocket collapsing its own chain but shrinks the
+        // natural pool; merging manufactured pockets in raises the floor on
+        // mazes where natural pockets are scarce, but on mazes where
+        // natural pockets already cover the length ladder well, a
+        // manufactured pocket can still steal a slot the greedy assignment
+        // would otherwise give a cheaper natural one (same level count,
+        // picked by insertion order) or exhaust the M door budget earlier,
+        // capping L below what natural-only reaches -- so natural-only must
+        // stay in the candidate pool, not just be a special case of the
+        // merged pool. recover_shallower retries a shallower ball per
+        // manufactured core when the deepest one fails prunability, and
+        // wide_seed_cap tries every eligible cell as a manufacturing core
+        // instead of only the 90 farthest from start; both recover pockets
+        // on scarce mazes but reorder which cells get consumed, so each can
+        // also displace a better core found elsewhere in seed order --
+        // measured directly (several seeds got WORSE when either was made
+        // the unconditional default). Both false/true pairs must stay
+        // available as separate candidates rather than one replacing the
+        // other. All variants are exact-BFS verified and only the
+        // strictly-better-than-portfolio result (if any) is used, so output
+        // quality never regresses; unreachable (-1) or absent-structure
+        // (empty plan, best_t stays -1) results are naturally rejected by
+        // the comparison.
         int binary_t = -1;
         AHC067Solver::Plan best_binary_plan;
         for (bool require_tree : {true, false}) {
             for (bool use_manufactured : {false, true}) {
                 for (bool manufactured_first : {false, true}) {
-                    int t = -1;
-                    AHC067Solver::Plan p =
-                        solver.build_binary_counter_plan(t, require_tree, manufactured_first, use_manufactured);
-                    if (t > binary_t) {
-                        binary_t = t;
-                        best_binary_plan = std::move(p);
+                    for (bool recover_shallower : {false, true}) {
+                        for (bool wide_seed_cap : {false, true}) {
+                            int t = -1;
+                            AHC067Solver::Plan p = solver.build_binary_counter_plan(
+                                t, require_tree, manufactured_first, use_manufactured, recover_shallower,
+                                wide_seed_cap);
+                            if (t > binary_t) {
+                                binary_t = t;
+                                best_binary_plan = std::move(p);
+                            }
+                            if (!use_manufactured) break; // no-op without manufactured pockets
+                        }
+                        if (!use_manufactured) break; // recover_shallower is a no-op without manufactured pockets
                     }
                     if (!use_manufactured) break; // manufactured_first is a no-op without manufactured pockets
                 }
