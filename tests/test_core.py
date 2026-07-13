@@ -28,6 +28,7 @@ from ahc_lab.db import ExperimentDB
 from ahc_lab.evaluator import Evaluator
 from ahc_lab.knowledge import search_knowledge
 from ahc_lab.novelty import normalize_cpp, normalized_source_fingerprint
+from ahc_lab.preflight import run_preflight
 from ahc_lab.policy import AcceptancePolicy, evaluate_acceptance
 from ahc_lab.runner import run_shell
 from ahc_lab.seeds import parse_seed_spec
@@ -940,6 +941,58 @@ time.sleep(30)
             self.assertEqual(trial["decision"], "error")
             self.assertEqual(trial["status"], "failed")
             self.assertIn("adapter failed", summary["error"])
+
+
+SLOW_ON_SEED_ZERO_SOLVER = """
+#include <chrono>
+#include <iostream>
+#include <thread>
+int main() {
+    long long target;
+    if (!(std::cin >> target)) return 0;
+    // Seed 0's generated target is even; sleep long enough to blow the
+    // safety margin (dummy time limit 2s, margin 1.9s) on that seed only.
+    if (target % 2 == 0) std::this_thread::sleep_for(std::chrono::milliseconds(2100));
+    std::cout << target << '\\n';
+    return 0;
+}
+"""
+
+
+class PreflightTest(unittest.TestCase):
+    def test_fast_solver_passes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_s:
+            tmp = _make_dummy_root(Path(tmp_s), ECHO_SOLVER)
+            result = run_preflight(tmp, "dummy", seeds=[0, 1, 2])
+            self.assertTrue(result["passed"])
+            self.assertEqual(result["seed_count"], 3)
+            self.assertEqual(result["failures"], [])
+            self.assertEqual(result["over_margin"], [])
+            self.assertLess(result["max_elapsed_sec"], result["threshold_sec"])
+
+    def test_slow_seed_fails_preflight(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_s:
+            tmp = _make_dummy_root(Path(tmp_s), SLOW_ON_SEED_ZERO_SOLVER)
+            db = ExperimentDB.default(tmp)
+            # Find a seed whose target is even (triggers the slow path) and
+            # one that is odd, so exactly one case blows the margin.
+            targets = {s: random.Random(s).randint(0, 1_000_000) for s in range(10)}
+            slow = next(s for s in range(10) if targets[s] % 2 == 0)
+            fast = next(s for s in range(10) if targets[s] % 2 == 1)
+            result = run_preflight(tmp, "dummy", seeds=[slow, fast], db=db)
+            self.assertFalse(result["passed"])
+            flagged = {row["seed"] for row in result["over_margin"]} | {
+                row["seed"] for row in result["failures"]
+            }
+            self.assertIn(slow, flagged)
+
+    def test_preflight_cli_exit_code(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_s:
+            tmp = _make_dummy_root(Path(tmp_s), ECHO_SOLVER)
+            code = cli_main(
+                ["--root", str(tmp), "preflight", "--problem", "dummy", "--seeds", "0-1"]
+            )
+            self.assertEqual(code, 0)
 
 
 class NoveltyUnitTest(unittest.TestCase):
