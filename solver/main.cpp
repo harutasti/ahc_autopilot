@@ -1207,7 +1207,7 @@ struct AHC067Solver {
         // swap-based hillclimb/anneal over the combined pool, instead of
         // leaving it unused.
         solution = improve(solution, combined_candidates, best_t, timer, best_t, iterations, accepted,
-                           t_composite, 1.88);
+                           t_composite, param_double("AHC_PARAM_T_FINAL", 1.80));
         return solution;
     }
 
@@ -1247,6 +1247,11 @@ int main() {
     }
 
     if (header.size() == 3) {
+        // Whole-program deadline: the binary-counter variant loop below has
+        // no internal time bound and runs after solve() has already spent
+        // its ~1.88s budget. One case over the 2s limit fails the entire
+        // submission, so remaining variants are skipped once this expires.
+        Timer total_timer(1.94);
         int n = header[0];
         int m = header[1];
         int k = header[2];
@@ -1300,6 +1305,7 @@ int main() {
                 for (bool manufactured_first : {false, true}) {
                     for (bool recover_shallower : {false, true}) {
                         for (bool wide_seed_cap : {false, true}) {
+                            if (total_timer.expired()) goto variants_done;
                             int t = -1;
                             AHC067Solver::Plan p = solver.build_binary_counter_plan(
                                 t, require_tree, manufactured_first, use_manufactured, recover_shallower,
@@ -1316,6 +1322,7 @@ int main() {
                 }
             }
         }
+    variants_done:;
         AHC067Solver::Plan *binary_plan = &best_binary_plan;
 
         if (binary_t > best_t) {
