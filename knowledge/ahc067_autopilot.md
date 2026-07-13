@@ -71,3 +71,9 @@ Auto-generated per generation.
 ## 2026-07-13 04:39 g1 StateDesignBuilder -> accepted
 - mean effective delta 2714691.8666666667, confidence 1.0, wins/ties/losses 22/7/1
 - verdict: mean effective delta 2714691.8666666667 is positive with 22 win(s), 1 loss(es)
+
+## 2026-07-13 05:04 g2 StateDesignBuilder -> accepted
+- mean effective delta 995046.6333333333, confidence 1.0, wins/ties/losses 13/17/0
+- verdict: mean effective delta 995046.6333333333 is positive with 13 win(s), 0 loss(es)
+- repair attempts: 2 (rejected -> accepted)
+- agent summary tail: e exactly (T=13662 and T=14492, matching baseline precisely) - Seeds 1, 3, 4 (previous wins) are unchanged - New wins recovered on seeds 5, 6, 15, 21, 24 (each +2.6M to +4.8M) that were pruned/unseen in the failed gate run - Max elapsed time 1.889s, matching baseline, well under the 2.0s budget - Clean build with `-Wall -Wextra`, no warnings No regressions remain across any locally testable seed.

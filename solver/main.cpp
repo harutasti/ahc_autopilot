@@ -397,13 +397,26 @@ struct AHC067Solver {
     }
 
     // Find dead-end pockets reachable from the start's side via exactly one
-    // bridge edge, each verified to be internally cycle-free so every edge
-    // inside it is a genuine, un-bypassable bottleneck. Pockets whose
-    // far side would still leave the goal reachable (side[goal_id]) are
-    // dead-end candidates for the binary-counter's recursive "ring"
-    // gadgets; pockets are consumed greedily so returned pockets never
-    // share a cell.
-    vector<Pocket> find_pockets() const {
+    // bridge edge. Pockets whose far side would still leave the goal
+    // reachable (side[goal_id]) are dead-end candidates for the
+    // binary-counter's recursive "ring" gadgets; pockets are consumed
+    // greedily so returned pockets never share a cell.
+    //
+    // require_tree controls whether a far side containing an internal cycle
+    // (a route that could let the hero bypass a prefix of the serial door
+    // chain, defeating the recursive AND-condition and collapsing the whole
+    // cascade) is skipped outright. This is a tradeoff, not a correctness
+    // requirement: evaluate_arrays() always re-verifies the final plan with
+    // exact BFS, and main() only ever swaps in a binary-counter plan when it
+    // strictly beats the portfolio fallback, so a cyclic pocket can never
+    // make output invalid or worse than not using it -- it can only
+    // occasionally make ITS OWN chain collapse (e.g. T=85 instead of the
+    // intended O(2^L) blowup). require_tree=true avoids that per-plan
+    // collapse risk but shrinks the usable pocket pool, which on
+    // pocket-scarce mazes caps L (and thus T) far below what the fuller,
+    // cyclic-tolerant pool reaches. The caller builds both variants and
+    // keeps whichever verifies higher, so neither tradeoff is paid blindly.
+    vector<Pocket> find_pockets(bool require_tree) const {
         vector<int> tin(cells.size(), -1), low(cells.size(), 0), bridges;
         int dfs_timer = 0;
         bridge_dfs(start_id, -1, tin, low, dfs_timer, bridges);
@@ -464,14 +477,20 @@ struct AHC067Solver {
 
             vector<char> in_far(cells.size(), 0);
             for (int c : far_cells) in_far[c] = 1;
-            // The far side may still contain internal cycles (extra edges
-            // beyond a spanning tree), which could let the hero bypass one
-            // of our chosen path's doors via a different internal route.
-            // We do not require a pure tree here: any such bypass can only
-            // ever make this candidate's true BFS T smaller than intended,
-            // never unsafe, because build_binary_counter_plan()'s result is
-            // always re-verified by evaluate_arrays() and only ever used
-            // when it strictly beats the portfolio fallback.
+            if (require_tree) {
+                // A pure tree has exactly far_count-1 internal edges; extra
+                // edges mean a cycle exists. Skip outright (without
+                // consuming its cells) so a genuinely tree-shaped bridge
+                // nested inside it can still be found separately.
+                int internal_edges = 0;
+                for (int c : far_cells) {
+                    for (const Adj &a : graph[c]) {
+                        if (in_far[a.to] && a.to > c) internal_edges++;
+                    }
+                }
+                if (internal_edges != static_cast<int>(far_cells.size()) - 1) continue;
+            }
+
             vector<int> dist(cells.size(), -1), parent_cell(cells.size(), -1), parent_edge(cells.size(), -1);
             queue<int> q;
             dist[far_root] = 0;
@@ -538,10 +557,10 @@ struct AHC067Solver {
     // bottleneck; the caller must still gate acceptance on evaluate_arrays
     // returning a value that beats the fallback, since maze structure
     // (few or short pockets, no essential bridge) can make this a no-op.
-    Plan build_binary_counter_plan(int &result_t) {
+    Plan build_binary_counter_plan(int &result_t, bool require_tree) {
         Plan plan;
         result_t = -1;
-        vector<Pocket> pockets = find_pockets();
+        vector<Pocket> pockets = find_pockets(require_tree);
         if (pockets.empty()) return plan;
 
         sort(pockets.begin(), pockets.end(), [](const Pocket &a, const Pocket &b) {
@@ -971,17 +990,32 @@ int main() {
         // Switch-parity binary-counter fallback candidate: a recursive
         // dead-end-pocket gadget that can force order-of-magnitude more
         // forced corridor round trips than the additive gate portfolio
-        // above, when the maze has enough dead-end structure for it. Only
-        // ever swapped in when its exact BFS result strictly beats the
-        // portfolio's, so output quality never regresses; unreachable
-        // (-1) or absent-structure (empty plan, best_t stays -1) results
-        // are naturally rejected by the comparison.
-        int binary_t = -1;
-        AHC067Solver::Plan binary_plan = solver.build_binary_counter_plan(binary_t);
+        // above, when the maze has enough dead-end structure for it. Built
+        // in two variants -- tree-only pockets (immune to a cyclic pocket
+        // collapsing its own chain) and the fuller cyclic-tolerant pocket
+        // pool (more slots available, so higher L, on pocket-scarce mazes
+        // where the tree-only pool caps L too low) -- since neither variant
+        // dominates the other across mazes. Both are exact-BFS verified and
+        // only the strictly-better-than-portfolio result (if any) is used,
+        // so output quality never regresses; unreachable (-1) or
+        // absent-structure (empty plan, best_t stays -1) results are
+        // naturally rejected by the comparison.
+        int binary_t_tree = -1;
+        AHC067Solver::Plan binary_plan_tree = solver.build_binary_counter_plan(binary_t_tree, true);
+        int binary_t_any = -1;
+        AHC067Solver::Plan binary_plan_any = solver.build_binary_counter_plan(binary_t_any, false);
+
+        int binary_t = binary_t_tree;
+        AHC067Solver::Plan *binary_plan = &binary_plan_tree;
+        if (binary_t_any > binary_t) {
+            binary_t = binary_t_any;
+            binary_plan = &binary_plan_any;
+        }
+
         if (binary_t > best_t) {
-            solver.print_plan(binary_plan);
+            solver.print_plan(*binary_plan);
             cerr << "ahc067 baseline_t=" << baseline_t << " best_t=" << binary_t
-                 << " gates=" << binary_plan.switch_cell_type.size() << " candidates=" << candidate_count
+                 << " gates=" << binary_plan->switch_cell_type.size() << " candidates=" << candidate_count
                  << " iterations=" << iterations << " accepted=" << accepted << " source=binary_counter\n";
         } else {
             solver.print_solution(solution);
