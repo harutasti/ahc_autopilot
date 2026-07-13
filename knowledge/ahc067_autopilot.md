@@ -67,3 +67,7 @@ Auto-generated per generation.
 - repair attempts: 3 (rejected -> duplicate -> rejected)
 - pruned early: 3 worsening seed(s) exceed the budget of 1
 - agent summary tail: ously-tried source in `experiments/sources/` that this candidate is not a duplicate. **Risk:** Low — every phase result is still gated by exact BFS `evaluate()`/`best_t` tracking, so output is monotonically non-decreasing regardless of schedule; only the search trajectory changes. Timing margin is preserved (max observed 1.893s, well under the 2.0s hard limit, same 1.88 final cutoff as baseline).
+
+## 2026-07-13 04:39 g1 StateDesignBuilder -> accepted
+- mean effective delta 2714691.8666666667, confidence 1.0, wins/ties/losses 22/7/1
+- verdict: mean effective delta 2714691.8666666667 is positive with 22 win(s), 1 loss(es)
