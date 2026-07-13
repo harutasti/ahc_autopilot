@@ -101,15 +101,20 @@ struct AHC067Solver {
         vector<pair<int, int>> switch_cell_type;
     };
 
-    // A dead-end pocket hanging off a single entrance bridge, verified to
-    // be an internally cycle-free (tree) region so no edge inside it can
-    // be bypassed by an alternate route. path_edges[0] is the entrance
-    // bridge; path_cells[i] is the cell reached after crossing
-    // path_edges[i]. Both are ordered from the hub outward to the
-    // farthest reachable cell (found via BFS-farthest inside the tree).
+    // A dead-end pocket reached from the hub via a serial sequence of
+    // levels, ordered hub-to-deep. Each level is a SET of edges gated by
+    // the same door type once the pocket is consumed for a ring at least
+    // that deep. A natural pocket (see find_pockets) has exactly one edge
+    // per level -- a genuine graph bridge, verified internally cycle-free
+    // when require_tree is set. A manufactured pocket (see
+    // find_cut_pockets) can have several edges per level: doors of the
+    // same type share open/close state, so sealing every entrance edge of
+    // a multi-entrance region with that type collapses the whole region
+    // into a single controllable gate, even though no single edge among
+    // them is a graph bridge on its own.
     struct Pocket {
-        vector<int> path_edges;
-        vector<int> path_cells;
+        vector<vector<int>> level_edges;
+        int switch_cell;
     };
 
     int n;
@@ -396,6 +401,42 @@ struct AHC067Solver {
         return -1;
     }
 
+    // BFS over every cell NOT marked in excluded, starting from start_id,
+    // and report whether that BFS reaches every non-excluded cell -- i.e.
+    // whether (cells \ excluded) is a single connected piece. This is a
+    // much stronger requirement than "goal stays reachable": a manufactured
+    // region that merely leaves SOME start-goal route intact can still sit
+    // astride the only corridor to a DIFFERENT ring's pocket, silently
+    // making that other pocket (and hence the whole recursive cascade)
+    // unreachable whenever this region's door is closed (its default
+    // state). Requiring the complement to stay fully connected guarantees
+    // the region is a genuine dead-end appendage -- closing it off can
+    // never cut the rest of the maze off from itself, no matter which
+    // other pockets end up assigned elsewhere in that same complement.
+    bool region_is_prunable(const vector<char> &excluded) const {
+        if (excluded[start_id] || excluded[goal_id]) return false;
+        int total_remaining = 0;
+        for (int c = 0; c < static_cast<int>(cells.size()); c++) {
+            if (!excluded[c]) total_remaining++;
+        }
+        vector<char> visited(cells.size(), 0);
+        queue<int> q;
+        visited[start_id] = 1;
+        int reached = 1;
+        q.push(start_id);
+        while (!q.empty()) {
+            int u = q.front();
+            q.pop();
+            for (const Adj &a : graph[u]) {
+                if (excluded[a.to] || visited[a.to]) continue;
+                visited[a.to] = 1;
+                reached++;
+                q.push(a.to);
+            }
+        }
+        return visited[goal_id] != 0 && reached == total_remaining;
+    }
+
     // Find dead-end pockets reachable from the start's side via exactly one
     // bridge edge. Pockets whose far side would still leave the goal
     // reachable (side[goal_id]) are dead-end candidates for the
@@ -416,7 +457,12 @@ struct AHC067Solver {
     // pocket-scarce mazes caps L (and thus T) far below what the fuller,
     // cyclic-tolerant pool reaches. The caller builds both variants and
     // keeps whichever verifies higher, so neither tradeoff is paid blindly.
-    vector<Pocket> find_pockets(bool require_tree) const {
+    //
+    // consumed and used_edge are shared in/out state: every accepted
+    // pocket's far-side cells and level edges are marked here so a later
+    // call to find_cut_pockets (manufactured pockets, see below) never
+    // claims a cell or door already spoken for by a natural pocket.
+    vector<Pocket> find_pockets(bool require_tree, vector<char> &consumed, vector<char> &used_edge) const {
         vector<int> tin(cells.size(), -1), low(cells.size(), 0), bridges;
         int dfs_timer = 0;
         bridge_dfs(start_id, -1, tin, low, dfs_timer, bridges);
@@ -441,7 +487,6 @@ struct AHC067Solver {
         }
         sort(ranked_bridges.rbegin(), ranked_bridges.rend());
 
-        vector<char> consumed(cells.size(), 0);
         vector<Pocket> pockets;
 
         for (const auto &entry : ranked_bridges) {
@@ -460,7 +505,7 @@ struct AHC067Solver {
             } else {
                 continue;
             }
-            if (consumed[near_cell] || consumed[far_root]) continue;
+            if (consumed[near_cell] || consumed[far_root] || used_edge[edge_idx]) continue;
 
             vector<int> far_cells;
             for (int c = 0; c < static_cast<int>(cells.size()); c++) {
@@ -510,26 +555,116 @@ struct AHC067Solver {
             }
 
             Pocket p;
-            p.path_edges.push_back(edge_idx);
-            p.path_cells.push_back(far_root);
-            vector<int> tail_edges, tail_cells;
+            p.level_edges.push_back({edge_idx});
+            vector<int> tail_edges;
             int cur = farthest;
             while (cur != far_root) {
                 tail_edges.push_back(parent_edge[cur]);
-                tail_cells.push_back(cur);
                 cur = parent_cell[cur];
             }
             reverse(tail_edges.begin(), tail_edges.end());
-            reverse(tail_cells.begin(), tail_cells.end());
-            for (size_t idx = 0; idx < tail_edges.size(); idx++) {
-                p.path_edges.push_back(tail_edges[idx]);
-                p.path_cells.push_back(tail_cells[idx]);
-            }
+            for (int e : tail_edges) p.level_edges.push_back({e});
+            p.switch_cell = farthest;
 
             pockets.push_back(p);
             for (int c : far_cells) consumed[c] = 1;
+            used_edge[edge_idx] = 1;
+            for (int e : tail_edges) used_edge[e] = 1;
         }
         return pockets;
+    }
+
+    // Manufacture pockets out of multi-entrance regions when natural
+    // single-bridge dead ends are scarce. Doors of the same type share
+    // open/close state, so sealing EVERY entrance edge of a region with
+    // that type collapses the whole region into one controllable gate --
+    // functionally a single bridge, but built from several physical doors.
+    // Concentric BFS "shells" around a chosen core cell give this for free
+    // with several nested levels at once: shell d's boundary (edges
+    // between distance d-1 and distance d from the core, over the WHOLE
+    // graph) is disjoint from every other shell's boundary by construction
+    // (adjacent cells' BFS distances differ by at most 1), so assigning
+    // shell d's edges the door type for level (usable_levels-d+1)
+    // reproduces the serial multi-bit AND-chain build_binary_counter_plan
+    // needs -- without requiring the region to be a literal single-file
+    // corridor. Growth stops at the first shell that is too wide (over
+    // cut_cap edges) or collides with an edge/cell already claimed by an
+    // earlier pocket, keeping every shell found before that point. A
+    // region is only accepted when start and goal stay connected with the
+    // ENTIRE region removed, so the manufactured pocket is a genuine
+    // optional detour, never load-bearing for base connectivity.
+    vector<Pocket> find_cut_pockets(int cut_cap, int max_levels, vector<char> &consumed,
+                                    vector<char> &used_edge) const {
+        vector<Pocket> result;
+        vector<int> dist_start = bfs_cell(start_id);
+        vector<int> seeds;
+        for (int c = 0; c < static_cast<int>(cells.size()); c++) {
+            if (c == start_id || c == goal_id || consumed[c] || dist_start[c] < 0) continue;
+            seeds.push_back(c);
+        }
+        sort(seeds.begin(), seeds.end(), [&](int a, int b) { return dist_start[a] > dist_start[b]; });
+        int seed_cap = min(static_cast<int>(seeds.size()), 90);
+
+        for (int si = 0; si < seed_cap; si++) {
+            int core = seeds[si];
+            if (consumed[core]) continue;
+            vector<int> dist_core = bfs_cell(core);
+            int maxd = 0;
+            for (int c = 0; c < static_cast<int>(cells.size()); c++) {
+                maxd = max(maxd, dist_core[c]);
+            }
+            int cap_levels = min(max_levels, maxd);
+            if (cap_levels < 1) continue;
+
+            vector<vector<int>> shell_cut(cap_levels + 1);
+            int usable_levels = 0;
+            for (int d = 1; d <= cap_levels; d++) {
+                vector<int> cut_edges;
+                bool collision = false;
+                for (int eidx = 0; eidx < static_cast<int>(edges.size()); eidx++) {
+                    int a = edges[eidx].u, b = edges[eidx].v;
+                    int da = dist_core[a], db = dist_core[b];
+                    bool crosses = (da == d - 1 && db == d) || (da == d && db == d - 1);
+                    if (!crosses) continue;
+                    if (used_edge[eidx]) {
+                        collision = true;
+                        break;
+                    }
+                    cut_edges.push_back(eidx);
+                }
+                if (collision || cut_edges.empty() || static_cast<int>(cut_edges.size()) > cut_cap) break;
+                shell_cut[d] = cut_edges;
+                usable_levels = d;
+            }
+            if (usable_levels < 1) continue;
+
+            vector<char> region(cells.size(), 0);
+            bool bad = false;
+            for (int c = 0; c < static_cast<int>(cells.size()); c++) {
+                if (dist_core[c] < 0 || dist_core[c] > usable_levels - 1) continue;
+                if (c == start_id || c == goal_id || consumed[c]) {
+                    bad = true;
+                    break;
+                }
+                region[c] = 1;
+            }
+            if (bad || !region_is_prunable(region)) continue;
+
+            Pocket p;
+            for (int j = 1; j <= usable_levels; j++) {
+                p.level_edges.push_back(shell_cut[usable_levels - j + 1]);
+            }
+            p.switch_cell = core;
+            result.push_back(p);
+
+            for (int c = 0; c < static_cast<int>(cells.size()); c++) {
+                if (region[c]) consumed[c] = 1;
+            }
+            for (const auto &lvl : p.level_edges) {
+                for (int e : lvl) used_edge[e] = 1;
+            }
+        }
+        return result;
     }
 
     // Switch-parity binary-counter construction: a recursive "Baguenaudier
@@ -557,14 +692,109 @@ struct AHC067Solver {
     // bottleneck; the caller must still gate acceptance on evaluate_arrays
     // returning a value that beats the fallback, since maze structure
     // (few or short pockets, no essential bridge) can make this a no-op.
-    Plan build_binary_counter_plan(int &result_t, bool require_tree) {
+    // manufactured_first controls search order between the two pocket
+    // finders. Natural pockets are free-riding graph bridges, but there can
+    // be dozens of tiny ones (length 1-2) scattered through the same open
+    // area a good manufactured "onion" core would otherwise grow through;
+    // claiming those first can fragment the territory and starve a
+    // potentially deep manufactured chain down to 2-3 levels even though
+    // its true local geometry (checked in isolation) supports far more.
+    // Running manufactured search first lets a few large cores claim their
+    // territory before the swarm of small natural pockets nibbles at it;
+    // running natural first is cheaper (1 door/level) when natural pockets
+    // already cover the ladder well. Neither order dominates, so the
+    // caller builds both and keeps whichever verifies higher.
+    //
+    // use_manufactured lets the caller ALSO try a natural-pockets-only pool
+    // (find_cut_pockets skipped entirely). Merging manufactured pockets in
+    // is not always a strict improvement over natural-only, even though
+    // every individual manufactured pocket is independently a genuine
+    // dead-end appendage (region_is_prunable) and the whole plan is always
+    // exact-BFS reverified: the greedy length-ladder assignment picks the
+    // cheapest sufficient pocket per slot, so a manufactured pocket can
+    // still occupy a slot a natural pocket would have filled (same level
+    // count, lower sort key by pure chance of insertion order), or its
+    // extra per-level door cost can exhaust the M budget earlier and cap L
+    // below what natural-only reaches on mazes where natural coverage was
+    // already good. On mazes where natural pockets are scarce, merging
+    // manufactured in is what raises the floor. Neither pool dominates, so
+    // the caller builds both and keeps whichever verifies higher -- same
+    // discipline as require_tree and manufactured_first above.
+    Plan build_binary_counter_plan(int &result_t, bool require_tree, bool manufactured_first,
+                                    bool use_manufactured) {
         Plan plan;
         result_t = -1;
-        vector<Pocket> pockets = find_pockets(require_tree);
+
+        // Pick the final gate FIRST, before any pocket search. It must be a
+        // graph bridge that's essential for start-goal connectivity (goal
+        // unreachable without it), and among those we pick the one closest
+        // to goal (smallest goal-side component): that maximizes how much
+        // of the maze sits on the start side, available to pockets. This
+        // ordering matters for correctness, not just yield -- a pocket that
+        // hangs off the backbone on the FAR side of whichever essential
+        // bridge gets gated last would need bit L set to reach it, but bit
+        // L only gets set by visiting ring L's own pocket, so such a pocket
+        // would be permanently unreachable (a silent deadlock, not merely a
+        // shorter chain). Restricting every pocket search below to cells
+        // reachable from start without crossing final_edge rules that out
+        // entirely, regardless of which essential bridge ends up chosen.
+        vector<int> tin(cells.size(), -1), low(cells.size(), 0), bridges;
+        int dfs_timer = 0;
+        bridge_dfs(start_id, -1, tin, low, dfs_timer, bridges);
+        int final_edge = -1;
+        int best_near_count = -1;
+        for (int edge_idx : bridges) {
+            vector<int> side = start_side_without_edge(edge_idx);
+            if (side[goal_id]) continue; // need an essential bridge: goal unreachable without it
+            int near_count = 0;
+            for (int c = 0; c < static_cast<int>(cells.size()); c++) {
+                if (side[c]) near_count++;
+            }
+            if (near_count > best_near_count) {
+                best_near_count = near_count;
+                final_edge = edge_idx;
+            }
+        }
+        if (final_edge < 0) return plan; // no true bottleneck to gate; this construction cannot apply
+
+        vector<int> final_near_side = start_side_without_edge(final_edge);
+
+        // Natural pockets first (cheapest: exactly 1 door per level), then
+        // fill gaps in the length ladder with manufactured pockets carved
+        // out of multi-entrance regions -- see find_cut_pockets. Both
+        // finders share consumed/used_edge state so no cell or door is
+        // ever claimed twice across the combined pool. Cells beyond
+        // final_edge are pre-marked consumed so neither finder can ever
+        // reach across it.
+        vector<char> consumed(cells.size(), 0);
+        vector<char> used_edge(edges.size(), 0);
+        for (int c = 0; c < static_cast<int>(cells.size()); c++) {
+            if (!final_near_side[c]) consumed[c] = 1;
+        }
+        vector<Pocket> pockets;
+        vector<Pocket> manufactured;
+        if (!use_manufactured) {
+            pockets = find_pockets(require_tree, consumed, used_edge);
+        } else if (manufactured_first) {
+            manufactured = find_cut_pockets(6, k - 1, consumed, used_edge);
+            pockets = find_pockets(require_tree, consumed, used_edge);
+        } else {
+            pockets = find_pockets(require_tree, consumed, used_edge);
+            manufactured = find_cut_pockets(6, k - 1, consumed, used_edge);
+        }
+        pockets.insert(pockets.end(), manufactured.begin(), manufactured.end());
         if (pockets.empty()) return plan;
 
+        // Sort by length first (how many ring slots a pocket can possibly
+        // serve), then by total door cost so a cheap natural pocket is
+        // preferred over a same-length manufactured one that needs more
+        // physical doors for the same number of levels.
         sort(pockets.begin(), pockets.end(), [](const Pocket &a, const Pocket &b) {
-            return a.path_edges.size() < b.path_edges.size();
+            if (a.level_edges.size() != b.level_edges.size()) return a.level_edges.size() < b.level_edges.size();
+            int cost_a = 0, cost_b = 0;
+            for (const auto &lvl : a.level_edges) cost_a += static_cast<int>(lvl.size());
+            for (const auto &lvl : b.level_edges) cost_b += static_cast<int>(lvl.size());
+            return cost_a < cost_b;
         });
 
         // Greedily match the smallest pocket long enough for slot r=1,2,3,...
@@ -576,38 +806,29 @@ struct AHC067Solver {
         int running_doors = 0;
         int r = 1;
         while (r <= k - 1) {
-            while (ptr < pockets.size() && static_cast<int>(pockets[ptr].path_edges.size()) < r) ptr++;
+            while (ptr < pockets.size() && static_cast<int>(pockets[ptr].level_edges.size()) < r) ptr++;
             if (ptr >= pockets.size()) break;
-            if (running_doors + r + 1 > m) break; // keep 1 door reserved for the final gate
+            int cost = 0;
+            for (int j = 0; j < r; j++) cost += static_cast<int>(pockets[ptr].level_edges[j].size());
+            if (running_doors + cost + 1 > m) break; // keep 1 door reserved for the final gate
             assigned.push_back(static_cast<int>(ptr));
-            running_doors += r;
+            running_doors += cost;
             ptr++;
             r++;
         }
         int L = static_cast<int>(assigned.size());
         if (L == 0) return plan;
 
-        vector<int> tin(cells.size(), -1), low(cells.size(), 0), bridges;
-        int dfs_timer = 0;
-        bridge_dfs(start_id, -1, tin, low, dfs_timer, bridges);
-        int final_edge = -1;
-        for (int edge_idx : bridges) {
-            vector<int> side = start_side_without_edge(edge_idx);
-            if (side[goal_id]) continue; // need an essential bridge: goal unreachable without it
-            final_edge = edge_idx;
-            break;
-        }
-        if (final_edge < 0) return plan; // no true bottleneck to gate; this construction cannot apply
-
         plan.switch_cell_type.push_back({start_id, 0});
         for (int i = 1; i <= L; i++) {
             const Pocket &p = pockets[assigned[i - 1]];
-            int total_len = static_cast<int>(p.path_edges.size());
             for (int j = 0; j < i; j++) {
                 int door_type = (j < i - 1) ? (2 * j) : (2 * (i - 1) + 1);
-                plan.door_edge_type.push_back({p.path_edges[j], door_type});
+                for (int e : p.level_edges[j]) {
+                    plan.door_edge_type.push_back({e, door_type});
+                }
             }
-            plan.switch_cell_type.push_back({p.path_cells[total_len - 1], i});
+            plan.switch_cell_type.push_back({p.switch_cell, i});
         }
         plan.door_edge_type.push_back({final_edge, 2 * L + 1});
 
@@ -991,26 +1212,40 @@ int main() {
         // dead-end-pocket gadget that can force order-of-magnitude more
         // forced corridor round trips than the additive gate portfolio
         // above, when the maze has enough dead-end structure for it. Built
-        // in two variants -- tree-only pockets (immune to a cyclic pocket
-        // collapsing its own chain) and the fuller cyclic-tolerant pocket
-        // pool (more slots available, so higher L, on pocket-scarce mazes
-        // where the tree-only pool caps L too low) -- since neither variant
-        // dominates the other across mazes. Both are exact-BFS verified and
-        // only the strictly-better-than-portfolio result (if any) is used,
-        // so output quality never regresses; unreachable (-1) or
+        // in up to six variants -- require_tree x {natural-only,
+        // manufactured_first, manufactured_last} -- since none dominates
+        // the other across mazes: require_tree=true is immune to a cyclic
+        // pocket collapsing its own chain but shrinks the natural pool;
+        // merging manufactured pockets in raises the floor on mazes where
+        // natural pockets are scarce, but on mazes where natural pockets
+        // already cover the length ladder well, a manufactured pocket can
+        // still steal a slot the greedy assignment would otherwise give a
+        // cheaper natural one (same level count, picked by insertion
+        // order) or exhaust the M door budget earlier, capping L below
+        // what natural-only reaches -- so natural-only must stay in the
+        // candidate pool, not just be a special case of the merged pool.
+        // All variants are exact-BFS verified and only the
+        // strictly-better-than-portfolio result (if any) is used, so
+        // output quality never regresses; unreachable (-1) or
         // absent-structure (empty plan, best_t stays -1) results are
         // naturally rejected by the comparison.
-        int binary_t_tree = -1;
-        AHC067Solver::Plan binary_plan_tree = solver.build_binary_counter_plan(binary_t_tree, true);
-        int binary_t_any = -1;
-        AHC067Solver::Plan binary_plan_any = solver.build_binary_counter_plan(binary_t_any, false);
-
-        int binary_t = binary_t_tree;
-        AHC067Solver::Plan *binary_plan = &binary_plan_tree;
-        if (binary_t_any > binary_t) {
-            binary_t = binary_t_any;
-            binary_plan = &binary_plan_any;
+        int binary_t = -1;
+        AHC067Solver::Plan best_binary_plan;
+        for (bool require_tree : {true, false}) {
+            for (bool use_manufactured : {false, true}) {
+                for (bool manufactured_first : {false, true}) {
+                    int t = -1;
+                    AHC067Solver::Plan p =
+                        solver.build_binary_counter_plan(t, require_tree, manufactured_first, use_manufactured);
+                    if (t > binary_t) {
+                        binary_t = t;
+                        best_binary_plan = std::move(p);
+                    }
+                    if (!use_manufactured) break; // manufactured_first is a no-op without manufactured pockets
+                }
+            }
         }
+        AHC067Solver::Plan *binary_plan = &best_binary_plan;
 
         if (binary_t > best_t) {
             solver.print_plan(*binary_plan);
