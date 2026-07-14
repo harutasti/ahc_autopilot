@@ -93,3 +93,8 @@ Auto-generated per generation.
 - mean effective delta 369678.0333333333, confidence 1.0, wins/ties/losses 26/4/0
 - verdict: mean effective delta 369678.0333333333 is positive with 26 win(s), 0 loss(es)
 - agent summary tail: I already have a background wait job (bkehp2esg) that will send a notification once the 100-seed comparison completes. I'll pause here until that notification arrives.
+
+## 2026-07-14 01:14 g2 StateDesignBuilder -> error
+- verdict: unrecoverable adapter failure (rate_limit): You've hit your session limit · resets 3am (UTC)
+- repair attempts: 3 (rejected -> rejected -> error)
+- agent summary tail: You've hit your session limit · resets 3am (UTC)
