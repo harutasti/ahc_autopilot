@@ -88,3 +88,8 @@ Auto-generated per generation.
 - mean effective delta 391476.73333333334, confidence 1.0, wins/ties/losses 17/13/0
 - verdict: mean effective delta 391476.73333333334 is positive with 17 win(s), 0 loss(es)
 - agent summary tail: ovably optimal given its pocket pool); closing that gap further would need a different pocket-composition strategy (e.g., directional shell growth away from start rather than whole-graph-distance balls, or multiple independent chains) — noted in knowledge for the next iteration rather than attempted here, since further cut_cap/seed_cap sweeps showed no more low-risk gains available in this design.
+
+## 2026-07-14 00:38 g1 StateDesignBuilder -> accepted
+- mean effective delta 369678.0333333333, confidence 1.0, wins/ties/losses 26/4/0
+- verdict: mean effective delta 369678.0333333333 is positive with 26 win(s), 0 loss(es)
+- agent summary tail: I already have a background wait job (bkehp2esg) that will send a notification once the 100-seed comparison completes. I'll pause here until that notification arrives.

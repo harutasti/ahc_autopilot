@@ -775,10 +775,60 @@ struct AHC067Solver {
     // (only meaningful when use_manufactured is set): see its comments for
     // why both are pool-composition tradeoffs, not strict wins, and must
     // stay separate candidates rather than replacing the original behavior.
+    //
+    // favor_deep_low_ranks changes WHICH pocket serves each rank without
+    // changing L or the door budget spent. The greedy ladder assignment
+    // below picks, for each rank r in increasing order, the SHALLOWEST
+    // pocket deep enough to serve it -- optimal for maximizing L, since for
+    // natural pockets the door cost of serving rank r is exactly r
+    // regardless of which qualifying pocket is chosen (only the first r of
+    // its levels ever get doors). That leaves any EXCESS depth of the
+    // chosen pocket as a free bonus corridor beyond the last gated door
+    // (switch_cell sits at the pocket's true bottom, not at level r), but
+    // ascending assignment systematically routes that bonus to whichever
+    // pocket happens to be barely-sufficient for its rank -- usually near
+    // zero bonus -- while any deeper pockets in the pool that were not
+    // load-bearing for feasibility go completely unused. Since ring 1 is
+    // toggled roughly twice as often as ring 2, four times as often as
+    // ring 3, and so on (the Chinese-rings recursion), the corridor length
+    // of whichever pocket serves rank 1 dominates the final T far more than
+    // any other rank's. favor_deep_low_ranks reassigns the SAME feasible L
+    // to a different pocket per rank: ranks L..2 are still matched
+    // smallest-sufficient-first (in descending order, an equally valid
+    // maximum-matching greedy for this nested-compatibility structure, so L
+    // is unaffected), but whatever is left over after that -- specifically
+    // including any pocket whose depth was never actually needed for
+    // feasibility -- is handed to rank 1 by taking the DEEPEST remaining
+    // pocket, at the same door cost (1 door) as the shallowest one would
+    // have cost. This can only help: it is computed as an alternate
+    // candidate and only swapped in when it does not increase total door
+    // cost past M and does not fail to cover every rank (both checked
+    // explicitly), so a maze with no exploitable slack silently falls back
+    // to the original assignment.
+    //
+    // use_permanent_walls sacrifices ONE otherwise-unused switch type
+    // (index k-1) entirely: no switch of that type is ever placed, so any
+    // door of type 2*(k-1)+1 (closed-by-default) stays closed forever, a
+    // permanent wall costing only door budget, not a switch slot. The ring
+    // cascade is capped to at most k-2 levels to guarantee that reservation
+    // never collides with a cascade door type. Whatever door budget is left
+    // after the (now slightly shorter) cascade and the final gate is spent
+    // reshaping the "hub" -- every near-side cell not already claimed by a
+    // ring pocket -- into a long serpentine corridor via
+    // add_permanent_walls, so every physical step through the shared hub
+    // area (crossed on every single round trip, regardless of which ring)
+    // costs as many moves as the leftover door budget can force. This
+    // trades one ring level (halving the round-trip COUNT) for a
+    // potentially much longer per-trip distance; neither dominates the
+    // other in general, so it must stay a separate candidate the caller
+    // compares by exact-BFS T like every other variant here.
     Plan build_binary_counter_plan(int &result_t, bool require_tree, bool manufactured_first,
-                                    bool use_manufactured, bool recover_shallower, bool wide_seed_cap) {
+                                    bool use_manufactured, bool recover_shallower, bool wide_seed_cap,
+                                    bool favor_deep_low_ranks, bool use_permanent_walls) {
         Plan plan;
         result_t = -1;
+        int max_rank = use_permanent_walls ? (k - 2) : (k - 1);
+        if (max_rank < 1) return plan; // no room for even one ring once a switch type is sacrificed
 
         // Pick the final gate FIRST, before any pocket search. It must be a
         // graph bridge that's essential for start-goal connectivity (goal
@@ -860,7 +910,7 @@ struct AHC067Solver {
         size_t ptr = 0;
         int running_doors = 0;
         int r = 1;
-        while (r <= k - 1) {
+        while (r <= max_rank) {
             while (ptr < pockets.size() && static_cast<int>(pockets[ptr].level_edges.size()) < r) ptr++;
             if (ptr >= pockets.size()) break;
             int cost = 0;
@@ -873,6 +923,59 @@ struct AHC067Solver {
         }
         int L = static_cast<int>(assigned.size());
         if (L == 0) return plan;
+
+        if (favor_deep_low_ranks) {
+            // Re-derive the same L ranks from the full pool (not just the
+            // pockets the ascending pass happened to touch), matching
+            // ranks L..2 smallest-sufficient-first from the remaining pool
+            // (an equally valid maximum-matching greedy for this nested
+            // depth>=rank compatibility structure, so it cannot reduce
+            // feasibility below L), then handing rank 1 -- toggled far more
+            // often than any other rank -- whatever pocket is deepest among
+            // what is left over, at the same 1-door cost any other
+            // depth>=1 pocket would have cost. Swapped in only if it still
+            // covers all L ranks within the door budget; otherwise the
+            // original ascending assignment above is kept untouched.
+            vector<int> alt_assigned(L, -1);
+            vector<char> used(pockets.size(), 0);
+            bool ok = true;
+            int alt_running_doors = 0;
+            for (int rank = L; rank >= 2 && ok; rank--) {
+                int best_idx = -1;
+                for (int idx = 0; idx < static_cast<int>(pockets.size()); idx++) {
+                    if (used[idx] || static_cast<int>(pockets[idx].level_edges.size()) < rank) continue;
+                    if (best_idx < 0 || pockets[idx].level_edges.size() < pockets[best_idx].level_edges.size()) {
+                        best_idx = idx;
+                    }
+                }
+                if (best_idx < 0) {
+                    ok = false;
+                    break;
+                }
+                used[best_idx] = 1;
+                alt_assigned[rank - 1] = best_idx;
+                for (int j = 0; j < rank; j++) alt_running_doors += static_cast<int>(pockets[best_idx].level_edges[j].size());
+            }
+            if (ok) {
+                int best_idx = -1;
+                for (int idx = 0; idx < static_cast<int>(pockets.size()); idx++) {
+                    if (used[idx] || pockets[idx].level_edges.empty()) continue;
+                    if (best_idx < 0 || pockets[idx].level_edges.size() > pockets[best_idx].level_edges.size()) {
+                        best_idx = idx;
+                    }
+                }
+                if (best_idx < 0) {
+                    ok = false;
+                } else {
+                    alt_assigned[0] = best_idx;
+                    alt_running_doors += static_cast<int>(pockets[best_idx].level_edges[0].size());
+                }
+            }
+            if (ok && alt_running_doors + 1 <= m) {
+                assigned = std::move(alt_assigned);
+                running_doors = alt_running_doors;
+            }
+        }
 
         plan.switch_cell_type.push_back({start_id, 0});
         for (int i = 1; i <= L; i++) {
@@ -887,12 +990,104 @@ struct AHC067Solver {
         }
         plan.door_edge_type.push_back({final_edge, 2 * L + 1});
 
+        if (use_permanent_walls) {
+            int wall_budget = m - static_cast<int>(plan.door_edge_type.size());
+            add_permanent_walls(plan, wall_budget, k - 1, final_near_side, consumed);
+        }
+
         vector<int> door_type(edges.size(), -1);
         vector<int> switch_type(cells.size(), -1);
         for (const auto &entry : plan.door_edge_type) door_type[entry.first] = entry.second;
         for (const auto &entry : plan.switch_cell_type) switch_type[entry.first] = entry.second;
         result_t = evaluate_arrays(door_type, switch_type);
         return plan;
+    }
+
+    // Reshape the "hub" -- every near-side cell not already claimed by a
+    // ring pocket -- into a long serpentine corridor using wall_type, a
+    // switch type the caller guarantees is never assigned to any switch
+    // (so its closed-by-default door type, 2*wall_type+1, stays closed
+    // forever; unlimited edges may share it since it costs door budget,
+    // not a switch slot). A DFS spanning tree over the hub's currently-
+    // free (undoored) edges is exactly the classic "recursive backtracker"
+    // maze generator: it winds through every hub cell along a single long
+    // path, so the tree alone already connects the whole hub, and every
+    // non-tree "chord" edge is a shortcut that makes the hub's actual
+    // shortest paths shorter than that winding tour. Removing a chord can
+    // therefore never disconnect the hub -- the tree's connectivity does
+    // not depend on which chords remain -- so up to wall_budget chords are
+    // sealed permanently, nearest to the start first (by plain BFS
+    // distance, ignoring every door), since that is the region every
+    // forced round trip re-crosses regardless of which ring it is bound
+    // for.
+    void add_permanent_walls(Plan &plan, int wall_budget, int wall_type, const vector<int> &final_near_side,
+                             const vector<char> &consumed) {
+        if (wall_budget <= 0) return;
+        vector<char> door_used(edges.size(), 0);
+        for (const auto &entry : plan.door_edge_type) door_used[entry.first] = 1;
+
+        vector<vector<pair<int, int>>> hub_adj(cells.size());
+        vector<int> eligible;
+        for (int eidx = 0; eidx < static_cast<int>(edges.size()); eidx++) {
+            if (door_used[eidx]) continue;
+            int u = edges[eidx].u, v = edges[eidx].v;
+            if (!final_near_side[u] || !final_near_side[v]) continue;
+            if (consumed[u] || consumed[v]) continue;
+            hub_adj[u].push_back({v, eidx});
+            hub_adj[v].push_back({u, eidx});
+            eligible.push_back(eidx);
+        }
+        if (eligible.empty()) return;
+
+        // Shuffle neighbor order per cell so the backtracker winds instead
+        // of always following the same axis-aligned bias.
+        for (auto &adj : hub_adj) {
+            for (int i = static_cast<int>(adj.size()) - 1; i > 0; i--) {
+                int j = rng.next_int(0, i);
+                swap(adj[i], adj[j]);
+            }
+        }
+
+        vector<char> visited(cells.size(), 0);
+        vector<char> tree_edge(edges.size(), 0);
+        vector<pair<int, size_t>> stack;
+        visited[start_id] = 1;
+        stack.push_back({start_id, 0});
+        while (!stack.empty()) {
+            int u = stack.back().first;
+            size_t &i = stack.back().second;
+            if (i >= hub_adj[u].size()) {
+                stack.pop_back();
+                continue;
+            }
+            int v = hub_adj[u][i].first;
+            int eidx = hub_adj[u][i].second;
+            i++;
+            if (visited[v]) continue;
+            visited[v] = 1;
+            tree_edge[eidx] = 1;
+            stack.push_back({v, 0});
+        }
+
+        vector<int> dist_start = bfs_cell(start_id);
+        vector<int> chords;
+        for (int eidx : eligible) {
+            if (!tree_edge[eidx]) chords.push_back(eidx);
+        }
+        sort(chords.begin(), chords.end(), [&](int a, int b) {
+            int da = min(dist_start[edges[a].u], dist_start[edges[a].v]);
+            int db = min(dist_start[edges[b].u], dist_start[edges[b].v]);
+            if (da != db) return da < db;
+            return a < b;
+        });
+
+        int wall_door_type = 2 * wall_type + 1;
+        int sealed = 0;
+        for (int eidx : chords) {
+            if (sealed >= wall_budget) break;
+            plan.door_edge_type.push_back({eidx, wall_door_type});
+            sealed++;
+        }
     }
 
     void print_plan(const Plan &plan) const {
@@ -1298,27 +1493,47 @@ int main() {
         // quality never regresses; unreachable (-1) or absent-structure
         // (empty plan, best_t stays -1) results are naturally rejected by
         // the comparison.
+        //
+        // Two more independent dimensions multiply the per-round-trip
+        // corridor length instead of just the ring count: favor_deep_low_
+        // ranks reassigns which pocket serves which rank (same L, same
+        // door cost) so the most-frequently-toggled low ranks get whatever
+        // deep pockets the pool has to spare; use_permanent_walls
+        // sacrifices one switch type for unlimited permanent-wall doors
+        // that reshape the shared hub into a long serpentine corridor,
+        // trading one ring level for a much longer per-trip walk. Neither
+        // is a strict win over the original ladder (see
+        // build_binary_counter_plan's comments), so both stay opt-in
+        // candidates. They are placed as the OUTERMOST loops, true first,
+        // so the most promising combination gets first crack at the
+        // limited remaining time budget under total_timer -- solve() above
+        // already spends most of the 1.94s deadline, so later variants in
+        // iteration order may never run at all on a slow case.
         int binary_t = -1;
         AHC067Solver::Plan best_binary_plan;
-        for (bool require_tree : {true, false}) {
-            for (bool use_manufactured : {false, true}) {
-                for (bool manufactured_first : {false, true}) {
-                    for (bool recover_shallower : {false, true}) {
-                        for (bool wide_seed_cap : {false, true}) {
-                            if (total_timer.expired()) goto variants_done;
-                            int t = -1;
-                            AHC067Solver::Plan p = solver.build_binary_counter_plan(
-                                t, require_tree, manufactured_first, use_manufactured, recover_shallower,
-                                wide_seed_cap);
-                            if (t > binary_t) {
-                                binary_t = t;
-                                best_binary_plan = std::move(p);
+        for (bool use_permanent_walls : {true, false}) {
+            for (bool favor_deep_low_ranks : {true, false}) {
+                for (bool require_tree : {true, false}) {
+                    for (bool use_manufactured : {false, true}) {
+                        for (bool manufactured_first : {false, true}) {
+                            for (bool recover_shallower : {false, true}) {
+                                for (bool wide_seed_cap : {false, true}) {
+                                    if (total_timer.expired()) goto variants_done;
+                                    int t = -1;
+                                    AHC067Solver::Plan p = solver.build_binary_counter_plan(
+                                        t, require_tree, manufactured_first, use_manufactured, recover_shallower,
+                                        wide_seed_cap, favor_deep_low_ranks, use_permanent_walls);
+                                    if (t > binary_t) {
+                                        binary_t = t;
+                                        best_binary_plan = std::move(p);
+                                    }
+                                    if (!use_manufactured) break; // no-op without manufactured pockets
+                                }
+                                if (!use_manufactured) break; // recover_shallower is a no-op without manufactured pockets
                             }
-                            if (!use_manufactured) break; // no-op without manufactured pockets
+                            if (!use_manufactured) break; // manufactured_first is a no-op without manufactured pockets
                         }
-                        if (!use_manufactured) break; // recover_shallower is a no-op without manufactured pockets
                     }
-                    if (!use_manufactured) break; // manufactured_first is a no-op without manufactured pockets
                 }
             }
         }
