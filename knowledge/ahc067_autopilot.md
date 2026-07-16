@@ -98,3 +98,8 @@ Auto-generated per generation.
 - verdict: unrecoverable adapter failure (rate_limit): You've hit your session limit · resets 3am (UTC)
 - repair attempts: 3 (rejected -> rejected -> error)
 - agent summary tail: You've hit your session limit · resets 3am (UTC)
+
+## 2026-07-15 00:27 g1 StateDesignBuilder -> error
+- verdict: unrecoverable adapter failure (rate_limit): You've hit your session limit · resets 3:10am (UTC)
+- repair attempts: 3 (rejected -> rejected -> error)
+- agent summary tail: You've hit your session limit · resets 3:10am (UTC)
