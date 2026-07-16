@@ -109,3 +109,8 @@ Auto-generated per generation.
 - verdict: mean effective delta 213808.33333333334 is positive with 22 win(s), 1 loss(es)
 - repair attempts: 3 (rejected -> rejected -> accepted)
 - agent summary tail: seed is ≥ the previously-submitted candidate (zero new regressions) - Max elapsed time: ~1.928s (previously ~1.948s) — more safety margin under the 2.0s limit, not less - All 30 outputs pass the scorer's validity checks Net effect: worsening-seed count drops from 3 to 1 (at the allowed budget), with a large mean-score gain (~8.65M → ~8.87M across the local 30-seed set) and improved timing margin.
+
+## 2026-07-16 04:33 g1 StateDesignBuilder -> validation_failed
+- mean effective delta 23542.633333333335, confidence 0.998, wins/ties/losses 8/21/1
+- verdict: mean effective delta 23542.633333333335 is positive with 8 win(s), 1 loss(es)
+- agent summary tail: ed sub-budget that cannot exceed what the mandatory sweep leaves unused. This is a modest, safe increment (consistent with session 11's own "+214k, modest" framing) — the ~30,000 median-T target remains far off and would need a structurally different approach (e.g., a wider door-budget reallocation between ring depth and wall count, or per-target weighting across multiple ranks) to close further.
