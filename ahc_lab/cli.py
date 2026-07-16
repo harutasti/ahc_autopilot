@@ -292,8 +292,9 @@ def main(argv: list[str] | None = None) -> int:
         store = store_dir_for(db)
         previous_hash = None
         if args.checkout:
-            previous_hash = snapshot_solver_source(root, store)
-            restore_solver_source(store, source_hash, root)
+            solver_dir = load_problem_config(root, run["problem"]).solver_dir(root)
+            previous_hash = snapshot_solver_source(solver_dir, store)
+            restore_solver_source(store, source_hash, solver_dir)
         print(json.dumps({
             "run_id": args.run,
             "source_hash": source_hash,
@@ -346,6 +347,9 @@ def _init_problem(root: Path, name: str) -> None:
     config.write_text(_config_template(name), encoding="utf-8")
     (dest / "statement.md").write_text(_statement_template(name), encoding="utf-8")
     (dest / "problem_brief.md").write_text(_problem_brief_template(name), encoding="utf-8")
+    solver_dir = dest / "solver"
+    solver_dir.mkdir(exist_ok=True)
+    (solver_dir / "main.cpp").write_text(_solver_template(), encoding="utf-8")
 
 
 def _config_template(name: str) -> str:
@@ -358,8 +362,11 @@ score_direction: max
 # Solver timeout in seconds. Set this to the contest time limit.
 time_limit_sec: 2
 
-# Build solver/main.cpp into the {{solver}} path.
-build_command: g++ -std=c++20 -O2 -pipe -Wall -Wextra -o {{build_dir}}/solver solver/main.cpp
+# Build the problem's solver into the {{solver}} path.
+build_command: g++ -std=c++20 -O2 -pipe -Wall -Wextra -o {{build_dir}}/solver {{problem_dir}}/solver/main.cpp
+
+# Source directory for this problem's solver (relative to repo root).
+solver_dir: problems/{name}/solver
 
 # Generate one input for {{seed}} and write it to {{input}}.
 # Replace this with the official generator command for real contests.
@@ -384,6 +391,20 @@ score_regex: SCORE:\\s*([-+0-9.eE]+)
 #   max_elapsed_sec: 1.9
 #   neutral_speedup_ratio: 0.05
 #   min_improve_confidence: 0.9
+"""
+
+
+def _solver_template() -> str:
+    return """#include <iostream>
+using namespace std;
+
+// Starter solver. Read the input, print a valid (low-scoring) output, then
+// improve. Replace this with the real solver for the problem.
+int main() {
+    ios::sync_with_stdio(false);
+    cin.tie(nullptr);
+    return 0;
+}
 """
 
 

@@ -12,8 +12,7 @@ def store_dir_for(db: Any) -> Path:
     return db.path.parent / "sources"
 
 
-def _source_files(root: Path) -> list[Path]:
-    solver_dir = root / "solver"
+def _source_files(solver_dir: Path) -> list[Path]:
     if not solver_dir.is_dir():
         return []
     files: list[Path] = []
@@ -27,14 +26,13 @@ def _source_files(root: Path) -> list[Path]:
     return files
 
 
-def snapshot_solver_source(root: Path, store_dir: Path) -> str | None:
-    """Store a content-addressed copy of `root/solver` and return its hash.
+def snapshot_solver_source(solver_dir: Path, store_dir: Path) -> str | None:
+    """Store a content-addressed copy of `solver_dir` and return its hash.
 
     Identical sources share one snapshot, so calling this on every run is
     cheap. Returns None when there is no solver source to snapshot.
     """
-    solver_dir = root / "solver"
-    files = _source_files(root)
+    files = _source_files(solver_dir)
     if not files:
         return None
     digest = hashlib.sha256()
@@ -94,12 +92,11 @@ def diff_snapshots(
     return joined
 
 
-def restore_solver_source(store_dir: Path, source_hash: str, root: Path) -> Path:
-    """Copy a stored snapshot back into `root/solver` and return that path."""
+def restore_solver_source(store_dir: Path, source_hash: str, solver_dir: Path) -> Path:
+    """Copy a stored snapshot back into `solver_dir` and return that path."""
     snapshot = store_dir / source_hash
     if not snapshot.is_dir():
         raise FileNotFoundError(f"missing source snapshot: {snapshot}")
-    solver_dir = root / "solver"
     for path in sorted(snapshot.rglob("*")):
         if not path.is_file():
             continue

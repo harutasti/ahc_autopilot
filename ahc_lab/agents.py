@@ -13,6 +13,7 @@ from typing import Any
 
 from .analysis import analyze_run, compare_runs, make_ai_brief, write_analysis_markdown
 from .archive import ArchiveEntry, build_archive, sample_parents
+from .config import load_problem_config
 from .db import ExperimentDB
 from .evaluator import Evaluator, default_jobs
 from .knowledge import search_knowledge
@@ -408,6 +409,8 @@ class Autopilot:
         self.root = root.resolve()
         self.problem = problem
         self.db = db or ExperimentDB.default(self.root)
+        # Source lives at <root>/<solver_rel> (per-problem, defaults to solver/).
+        self.solver_rel = load_problem_config(self.root, problem).solver_rel
 
     def run(
         self,
@@ -581,7 +584,7 @@ class Autopilot:
                         restore_solver_source(
                             store_dir_for(self.db),
                             parent.source_hash,
-                            Path(workspace["path"]),
+                            Path(workspace["path"]) / self.solver_rel,
                         )
                         prompt_run_id = parent.run_id
                         prompt_analysis = analyze_run(self.db, parent.run_id)
@@ -878,6 +881,7 @@ class Autopilot:
         """
         db = ExperimentDB(self.db.path)
         candidate_root = Path(workspace_path)
+        candidate_solver = candidate_root / self.solver_rel
         candidate_tag = f"autopilot_s{session_id}_{candidate_name}"
         max_attempts = 1 + max(0, repair_attempts)
         original_prompt = prompt_path.read_text(encoding="utf-8")
@@ -899,7 +903,7 @@ class Autopilot:
                 duplicate_info: dict[str, Any] | None = None
                 cascade_info: dict[str, Any] | None = None
                 try:
-                    start_hash = snapshot_solver_source(candidate_root, store_dir_for(db))
+                    start_hash = snapshot_solver_source(candidate_solver, store_dir_for(db))
                     adapter_timeout: str | None = None
                     try:
                         self._run_adapter(
@@ -913,13 +917,13 @@ class Autopilot:
                         # Salvage: a timed-out agent may still have left a
                         # complete-enough candidate in the workspace.
                         adapter_timeout = str(exc)
-                    exact_hash = snapshot_solver_source(candidate_root, store_dir_for(db))
+                    exact_hash = snapshot_solver_source(candidate_solver, store_dir_for(db))
                     if adapter_timeout is not None and (
                         exact_hash is None or exact_hash == start_hash
                     ):
                         raise RuntimeError(adapter_timeout)
                     norm_hash = (
-                        normalized_source_fingerprint(candidate_root / "solver")
+                        normalized_source_fingerprint(candidate_solver)
                         if exact_hash is not None
                         else None
                     )
@@ -1307,11 +1311,12 @@ class Autopilot:
         source_hash = self.db.get_run(candidate_run_id).get("source_hash")
         if not source_hash:
             raise RuntimeError(f"run {candidate_run_id} has no source snapshot to merge")
-        restore_solver_source(store_dir_for(self.db), source_hash, self.root)
+        mainline_solver = self.root / self.solver_rel
+        restore_solver_source(store_dir_for(self.db), source_hash, mainline_solver)
         self.db.record_patch(
             trial_id=trial_id,
             candidate_name=candidate_name,
-            path=str(self.root / "solver"),
+            path=str(mainline_solver),
             summary=f"merged accepted source {source_hash[:12]} from run {candidate_run_id}",
             status="merged",
         )

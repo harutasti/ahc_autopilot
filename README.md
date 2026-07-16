@@ -67,12 +67,17 @@ commands have a stable source of problem truth.
 name: ahc999
 score_direction: max
 time_limit_sec: 2
-build_command: g++ -std=c++20 -O2 -pipe -Wall -Wextra -o {build_dir}/solver solver/main.cpp
+build_command: g++ -std=c++20 -O2 -pipe -Wall -Wextra -o {build_dir}/solver {problem_dir}/solver/main.cpp
+solver_dir: problems/ahc999/solver
 generator_command: python3 {problem_dir}/tools/generator.py --seed {seed} > {input}
 run_command: "{solver} < {input} > {output}"
 score_command: python3 {problem_dir}/tools/scorer.py {input} {output}
 score_regex: SCORE:\s*([-+0-9.eE]+)
 ```
+
+Each problem owns its solver source under `problems/<name>/solver/`, so
+problems never share one mainline slot. `ahc init-problem <name>` scaffolds
+this directory with a starter `main.cpp`.
 
 ### `config.yaml` fields
 
@@ -81,7 +86,8 @@ Required fields:
 - `name`: Problem name. Usually the same as the directory name, such as `ahc001`.
 - `score_direction`: Use `max` when a larger score is better, or `min` when a smaller score is better.
 - `time_limit_sec`: Solver timeout in seconds. Set this to the contest time limit.
-- `build_command`: Command that builds `solver/main.cpp` into `{solver}`.
+- `build_command`: Command that builds `{problem_dir}/solver/main.cpp` into `{solver}`.
+- `solver_dir` (optional): Source directory for this problem's solver, relative to the repo root. Defaults to `solver`; real problems set `problems/<name>/solver` so each owns its source.
 - `generator_command`: Command that creates one input file from `{seed}` and writes it to `{input}`.
 - `run_command`: Command that runs the built solver with `{input}` and writes `{output}`.
 - `score_command`: Command that reads `{input}` and `{output}` and prints a score.
@@ -162,7 +168,7 @@ Then:
 - place the problem statement at `problems/ahc001/statement.md`;
 - place official generator/tester/visualizer tools under `problems/ahc001/tools/`;
 - update `problems/ahc001/config.yaml` so the commands call those tools;
-- replace `solver/main.cpp` with a valid baseline solver.
+- replace `problems/ahc001/solver/main.cpp` with a valid baseline solver.
 
 A valid baseline does not need to be strong. It only needs to compile, respect
 the output format, and pass the official tester/scorer so autopilot has a safe

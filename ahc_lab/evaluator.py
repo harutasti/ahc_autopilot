@@ -207,7 +207,9 @@ class Evaluator:
         build = self.build() if build_first else None
         if build is not None and not build.ok:
             raise RuntimeError(f"build failed:\n{build.stderr or build.stdout}")
-        source_hash = snapshot_solver_source(self.root, store_dir_for(self.db))
+        source_hash = snapshot_solver_source(
+            self.config.solver_dir(self.root), store_dir_for(self.db)
+        )
         params_json = json.dumps(params or {}, sort_keys=True)
         run_id = self.db.create_run(
             problem=self.config.name,

@@ -7,8 +7,11 @@ score_direction: max
 # Solver timeout in seconds. Set this to the contest time limit.
 time_limit_sec: 2
 
-# Build solver/main.cpp into the {solver} path.
-build_command: g++ -std=c++20 -O2 -pipe -Wall -Wextra -o {build_dir}/solver solver/main.cpp
+# Build the problem's solver into the {solver} path.
+build_command: g++ -std=c++20 -O2 -pipe -Wall -Wextra -o {build_dir}/solver {problem_dir}/solver/main.cpp
+
+# Source directory for this problem's solver (relative to repo root).
+solver_dir: problems/ahc067/solver
 
 # Generate one input for {seed} and write it to {input}.
 # Replace this with the official generator command for real contests.

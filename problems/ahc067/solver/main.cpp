@@ -1802,25 +1802,5 @@ int main() {
         return 0;
     }
 
-    Timer timer(4.95);
-    XorShift64 rng(123456789);
-
-    if (header.size() != 1) {
-        return 0;
-    }
-    int n = header[0];
-    vector<int> x(n), y(n), r(n);
-    for (int i = 0; i < n; i++) {
-        cin >> x[i] >> y[i] >> r[i];
-    }
-
-    // Valid AHC001 baseline: give every requested point a 1x1 rectangle.
-    // Points are unique, so these rectangles have positive area and never overlap.
-    for (int i = 0; i < n; i++) {
-        cout << x[i] << ' ' << y[i] << ' ' << x[i] + 1 << ' ' << y[i] + 1 << '\n';
-    }
-
-    (void)timer;
-    (void)rng;
     return 0;
 }
