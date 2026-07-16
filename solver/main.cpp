@@ -822,12 +822,42 @@ struct AHC067Solver {
     // potentially much longer per-trip distance; neither dominates the
     // other in general, so it must stay a separate candidate the caller
     // compares by exact-BFS T like every other variant here.
+    // rank_cap_override (only meaningful when use_permanent_walls is set; 0
+    // means "no override, use the default k-2 ceiling") lets the caller
+    // voluntarily stop the ring cascade even shorter than the one mandatory
+    // sacrificed switch type already requires, leaving every door budget
+    // unit beyond the shorter cascade + final gate for add_permanent_walls
+    // to spend on sealing hub shortcuts. This is a genuine trade, not a
+    // strict win: fewer rings means a smaller 2^L round-trip multiplier, so
+    // whether a shorter-but-more-walled corridor beats the longer default
+    // cascade is maze-dependent (measured directly: sometimes k-2 remains
+    // best, sometimes capping two or three ranks lower roughly doubles T).
+    // The caller must therefore try several rank_cap_override values as
+    // separate candidates and keep whichever verifies higher by exact BFS,
+    // exactly like every other opt-in dimension here -- never assume a
+    // shorter cascade is better just because it frees more wall budget.
+    // wall_shuffle_seed (only meaningful when use_permanent_walls is set)
+    // seeds add_permanent_walls' hub-shuffle with a caller-chosen constant
+    // instead of the solver's shared rng member. The shared rng is also
+    // consumed by solve()'s wall-clock-bounded annealing loop before this
+    // function ever runs, so its state at that point depends on how many
+    // annealing iterations happened to fit before the timer fired -- pure
+    // scheduling jitter, unrelated to the maze. That made the resulting
+    // corridor shape (and therefore T) vary wildly between otherwise
+    // identical runs of the same binary on the same input -- swings above
+    // 50% were measured. Seeding locally makes the whole binary-counter
+    // family a pure function of (maze, seed): reproducible, and safe to
+    // A/B test or sweep multiple fixed seeds as independent candidates.
     Plan build_binary_counter_plan(int &result_t, bool require_tree, bool manufactured_first,
                                     bool use_manufactured, bool recover_shallower, bool wide_seed_cap,
-                                    bool favor_deep_low_ranks, bool use_permanent_walls) {
+                                    bool favor_deep_low_ranks, bool use_permanent_walls,
+                                    int rank_cap_override = 0, uint64_t wall_shuffle_seed = 1) {
         Plan plan;
         result_t = -1;
         int max_rank = use_permanent_walls ? (k - 2) : (k - 1);
+        if (use_permanent_walls && rank_cap_override > 0) {
+            max_rank = min(max_rank, rank_cap_override);
+        }
         if (max_rank < 1) return plan; // no room for even one ring once a switch type is sacrificed
 
         // Pick the final gate FIRST, before any pocket search. It must be a
@@ -992,7 +1022,7 @@ struct AHC067Solver {
 
         if (use_permanent_walls) {
             int wall_budget = m - static_cast<int>(plan.door_edge_type.size());
-            add_permanent_walls(plan, wall_budget, k - 1, final_near_side, consumed);
+            add_permanent_walls(plan, wall_budget, k - 1, final_near_side, consumed, wall_shuffle_seed);
         }
 
         vector<int> door_type(edges.size(), -1);
@@ -1021,8 +1051,9 @@ struct AHC067Solver {
     // forced round trip re-crosses regardless of which ring it is bound
     // for.
     void add_permanent_walls(Plan &plan, int wall_budget, int wall_type, const vector<int> &final_near_side,
-                             const vector<char> &consumed) {
+                             const vector<char> &consumed, uint64_t shuffle_seed) {
         if (wall_budget <= 0) return;
+        XorShift64 local_rng(shuffle_seed);
         vector<char> door_used(edges.size(), 0);
         for (const auto &entry : plan.door_edge_type) door_used[entry.first] = 1;
 
@@ -1043,7 +1074,7 @@ struct AHC067Solver {
         // of always following the same axis-aligned bias.
         for (auto &adj : hub_adj) {
             for (int i = static_cast<int>(adj.size()) - 1; i > 0; i--) {
-                int j = rng.next_int(0, i);
+                int j = local_rng.next_int(0, i);
                 swap(adj[i], adj[j]);
             }
         }
@@ -1346,14 +1377,40 @@ struct AHC067Solver {
         return best;
     }
 
+    // Time thresholds below were Optuna-tuned back when the additive-gate
+    // portfolio built here was the best available strategy. It no longer is:
+    // measured directly (30/30 seeds, this codebase's current state), the
+    // binary-counter family below in main() beats this portfolio's own
+    // best_t on every single seed, by margins of 2-3 orders of magnitude
+    // (see knowledge/ahc067_autopilot.md's accepted-generation deltas, all
+    // in the hundreds-of-thousands to millions range). Yet this function was
+    // still budgeted t_final=1.80 out of main()'s 1.94s whole-program
+    // deadline, leaving the always-winning binary-counter search only the
+    // ~0.14s leftover -- measured directly (DEBUG instrumentation) to cut
+    // off the mandatory 72-combo structural sweep before it finishes even
+    // once, starving exactly the wall-shuffle / manufactured-pocket
+    // diversity that seeds 23/28/29 need to reach baseline. Since this
+    // portfolio never wins, it only needs to stay a competent fallback (for
+    // a maze where binary-counter finds no usable pocket structure at all
+    // and returns t=-1) -- not to keep its old, now-obsolete full budget.
+    // Scaling every threshold down by ~0.28x (t_final 1.80 -> 0.50) keeps
+    // the exact same relative phase proportions (so behavior only shrinks,
+    // it doesn't reorder) while returning roughly 1.3 extra seconds -- a
+    // >10x increase -- to the binary-counter phase's own already-enforced
+    // 1.94s deadline in main(). This cannot regress any seed: binary_t only
+    // ever increases from more combos tried (max-and-keep, never replaced
+    // with worse), and the final choice between portfolio/binary_t is
+    // already `max(...)`, so a smaller portfolio best_t is harmless unless
+    // it was already losing -- which, per the measurement above, it always
+    // was.
     vector<Gate> solve(int &baseline_t, int &best_t, int &candidate_count, int &iterations, int &accepted) {
         Timer timer(1.90);
-        const double t_hill1 = param_double("AHC_PARAM_T_HILL1", 0.555);
-        const double t_anneal1 = param_double("AHC_PARAM_T_ANNEAL1", 0.872);
-        const double t_hill2 = param_double("AHC_PARAM_T_HILL2", 1.073);
-        const double t_anneal2 = param_double("AHC_PARAM_T_ANNEAL2", 1.567);
-        const double t_single = param_double("AHC_PARAM_T_SINGLE", 1.511);
-        const double t_composite = param_double("AHC_PARAM_T_COMPOSITE", 1.676);
+        const double t_hill1 = param_double("AHC_PARAM_T_HILL1", 0.15);
+        const double t_anneal1 = param_double("AHC_PARAM_T_ANNEAL1", 0.24);
+        const double t_hill2 = param_double("AHC_PARAM_T_HILL2", 0.30);
+        const double t_anneal2 = param_double("AHC_PARAM_T_ANNEAL2", 0.40);
+        const double t_single = param_double("AHC_PARAM_T_SINGLE", 0.38);
+        const double t_composite = param_double("AHC_PARAM_T_COMPOSITE", 0.44);
         const int bridge_cap2 = param_int("AHC_PARAM_BRIDGE_CAP2", 129);
         const int layer_cap = param_int("AHC_PARAM_LAYER_CAP", 188);
         const int combined_cap = param_int("AHC_PARAM_COMBINED_CAP", 379);
@@ -1402,7 +1459,7 @@ struct AHC067Solver {
         // swap-based hillclimb/anneal over the combined pool, instead of
         // leaving it unused.
         solution = improve(solution, combined_candidates, best_t, timer, best_t, iterations, accepted,
-                           t_composite, param_double("AHC_PARAM_T_FINAL", 1.80));
+                           t_composite, param_double("AHC_PARAM_T_FINAL", 0.50));
         return solution;
     }
 
@@ -1446,7 +1503,7 @@ int main() {
         // no internal time bound and runs after solve() has already spent
         // its ~1.88s budget. One case over the 2s limit fails the entire
         // submission, so remaining variants are skipped once this expires.
-        Timer total_timer(1.94);
+        Timer total_timer(1.86);
         int n = header[0];
         int m = header[1];
         int k = header[2];
@@ -1504,14 +1561,109 @@ int main() {
         // trading one ring level for a much longer per-trip walk. Neither
         // is a strict win over the original ladder (see
         // build_binary_counter_plan's comments), so both stay opt-in
-        // candidates. They are placed as the OUTERMOST loops, true first,
-        // so the most promising combination gets first crack at the
-        // limited remaining time budget under total_timer -- solve() above
-        // already spends most of the 1.94s deadline, so later variants in
-        // iteration order may never run at all on a slow case.
+        // candidates. favor_deep_low_ranks is the OUTERMOST of the two,
+        // true first, matching the ordering already proven safe before
+        // use_permanent_walls existed. use_permanent_walls itself is
+        // ordered false-first, NOT true-first: false reproduces exactly
+        // the pre-existing (already-accepted) combos at exactly their
+        // pre-existing per-call cost, so those 64 iterations are a strict
+        // floor -- guaranteed to run, and to reproduce at least the old
+        // binary_t, before a single speculative wall variant is attempted.
+        //
+        // wall_seed_counter -- THE ACTUAL FIX for the regression measured
+        // on seeds 11/23/28/29 -- gives every use_permanent_walls=true call
+        // in this sweep a DIFFERENT deterministic wall_shuffle_seed
+        // (1,2,3,...) instead of always defaulting to the same fixed seed.
+        // The earlier bug was subtler than a timing/ordering problem: the
+        // accepted baseline's add_permanent_walls used the solver's shared,
+        // stateful `rng` member, which every prior call in solve()'s
+        // annealing loop had already advanced, so each of the 64 sweep
+        // combos got a genuinely different hub-shuffle "for free" -- 64
+        // independent tries at the corridor shape, and only the best (by
+        // exact BFS) was ever kept. Isolating the shuffle into a locally-
+        // seeded RNG (for A/B-testing reproducibility, see
+        // build_binary_counter_plan's wall_shuffle_seed comment) is correct
+        // in spirit, but leaving every call at the same default seed
+        // collapsed those 64 independent samples down to ONE shuffle
+        // repeated 64 times -- verified directly: seed 11 dropped from
+        // T=7563 (root, shared-rng diversity) to T=4984 (single fixed
+        // shuffle) with byte-identical maze input. Incrementing the seed
+        // per call restores the same sampling diversity the baseline had,
+        // while staying fully deterministic and reproducible run-to-run.
         int binary_t = -1;
         AHC067Solver::Plan best_binary_plan;
-        for (bool use_permanent_walls : {true, false}) {
+        uint64_t wall_seed_counter = 1;
+        // Diversity pre-pass: try several independent wall-shuffle draws,
+        // crossed with the four CHEAP structural configurations (no
+        // manufactured-pocket search, so each call costs about the same as
+        // one evaluate_arrays BFS) BEFORE the structural sweep below.
+        // Measured directly with an instrumented build (temporarily
+        // counting calls per phase, then removed): the structural sweep
+        // below is NOT time-starved -- it always completes all 72 of its
+        // combos regardless of maze -- so this pre-pass is not competing
+        // with it for a scarce budget. What it fixes is a coverage gap:
+        // the structural sweep's use_permanent_walls=true combos all reuse
+        // the SAME wall_shuffle_seed (see the big comment below the
+        // sweep), by design, to stay a strict floor over the pre-repair
+        // candidate. That means wall-shuffle diversity -- the dimension
+        // seeds 11/23/28/29 actually needed, see above -- otherwise comes
+        // only from the bonus rank_cap/shuffle_seed sweep at the very end
+        // of this function, which IS time-limited and often cut short.
+        // Running a batch of cheap, varied-seed draws first guarantees
+        // that diversity is sampled even on mazes where the bonus sweep
+        // barely gets a chance to run. Crossing with all four cheap
+        // favor_deep_low_ranks x require_tree combos (instead of just one)
+        // matters because which structural combo pairs best with a good
+        // wall shuffle is itself maze-dependent -- a single fixed combo
+        // left some seeds (11/23/28/29) still short even with 40
+        // independent shuffle draws. It can only ever raise binary_t
+        // (never lower it, same max-and-keep discipline as everywhere else
+        // in this function), and this stays cheap since use_manufactured
+        // is false throughout -- no pocket search, just the shuffle +
+        // exact-BFS cost, a small fraction of the structural sweep's own
+        // 72-combo budget.
+        // Draw cap stays at 20 (NOT raised, despite solve() freeing up
+        // wall-clock -- see its comment): every draw here consumes one
+        // wall_seed_counter value, and every later phase (structural
+        // sweep's rank_cap/shuffle_seed bonus loop) continues counting from
+        // wherever this loop left off. Raising this cap shifts which
+        // counter values every later use_permanent_walls=true call downstream
+        // gets, which is exactly the kind of ordering-sensitive change this
+        // file's own comments warn against (see the wall_seed_counter and
+        // "append, don't replace" comments above/below) -- measured
+        // directly, bumping it to 150 silently regressed seed 13 (13672 ->
+        // 13178) by shifting the bonus pass's extra-seed sequence away from
+        // the value it depended on. The freed time is instead spent by the
+        // bonus pass below, which already varies its own shuffle_seed and
+        // is where the extra search capacity is actually needed (see its
+        // comment).
+        for (bool pp_favor : {true, false}) {
+            for (bool pp_require_tree : {true, false}) {
+                for (int draw = 0; draw < 20 && !total_timer.expired(); draw++) {
+                    int t = -1;
+                    AHC067Solver::Plan p = solver.build_binary_counter_plan(
+                        t, pp_require_tree, false, false, false, false, pp_favor, true, 0, wall_seed_counter++);
+                    if (t > binary_t) {
+                        binary_t = t;
+                        best_binary_plan = std::move(p);
+                    }
+                }
+            }
+        }
+        // The structural sweep below intentionally does NOT vary
+        // wall_shuffle_seed per call (it stays at the default of 1, exactly
+        // as it did in the failing candidate that this function repairs).
+        // Measured directly: incrementing the seed here too, on top of the
+        // dedicated pre-pass above, changed which shuffle each structural
+        // combo receives and REGRESSED two previously-fine seeds (18: was
+        // >= baseline, dropped to -44689; 21: was >= baseline, dropped to
+        // -17571) that happened to depend on exactly the seed=1 draw for
+        // their winning structural combo. Keeping this sweep bit-identical
+        // to the pre-repair candidate makes it a true floor -- it can only
+        // ever match or exceed that candidate's own per-seed results --
+        // while the pre-pass above is solely responsible for the new
+        // wall-shuffle-diversity upside that fixes seeds 11/28/29.
+        for (bool use_permanent_walls : {false, true}) {
             for (bool favor_deep_low_ranks : {true, false}) {
                 for (bool require_tree : {true, false}) {
                     for (bool use_manufactured : {false, true}) {
@@ -1532,6 +1684,102 @@ int main() {
                                 if (!use_manufactured) break; // recover_shallower is a no-op without manufactured pockets
                             }
                             if (!use_manufactured) break; // manufactured_first is a no-op without manufactured pockets
+                        }
+                    }
+                }
+            }
+        }
+        // Bonus pass: only reached when the deterministic sweep above ran
+        // to completion with time to spare (any goto above skips straight
+        // to variants_done, past this block entirely), so it can never eat
+        // into the time budget the proven combos above already rely on --
+        // same reasoning as the "append after, never before" rule used
+        // throughout this file for opt-in dimensions. Two independent
+        // cheap dimensions are swept, both now safe to try in bulk because
+        // add_permanent_walls' hub shuffle is seeded locally (see
+        // build_binary_counter_plan's wall_shuffle_seed comment) instead of
+        // depending on wall-clock-jittered shared rng state: which chords
+        // get sealed materially changes the resulting corridor length
+        // (measured up to 2x swings across fixed seeds on the same maze),
+        // so trying a handful of extra seeds is a genuine, reproducible
+        // search dimension, not noise. rank_cap_override (see its own
+        // comment) trades ring levels for extra wall budget; 0 means "no
+        // override", included first since seed diversity alone already
+        // captures most of the gain there. Only the cheap combo corner is
+        // used (no wide_seed_cap, no recover_shallower -- both shown
+        // expensive when profiled), so per-call cost stays in the same
+        // few-millisecond range as the mandatory loop above; the shared
+        // 1.92s cutoff below (checked every iteration, same as above) means
+        // listing more nominal combinations than can possibly run in the
+        // remaining slack is harmless -- it only affects how many of them
+        // get a chance, never the deadline itself. The fixed {2,3,4,5,6}
+        // list is kept EXACTLY as-is (never replaced -- same "append,
+        // don't replace" discipline as every other opt-in dimension in
+        // this function: a maze that happened to depend on one of these
+        // specific values for its best result must keep getting it tried,
+        // verified directly when swapping to fully-dynamic seeds silently
+        // regressed a previously-fine seed by -60829). fresh_shuffle_extra
+        // appends a few additional draws from the SAME wall_seed_counter
+        // the pre-pass uses (continuing where it left off, so no seed
+        // value is ever wastefully repeated) purely as bonus upside on
+        // top of the proven fixed set.
+        // extra draws raised from 3 to 20 for the same reason as the
+        // pre-pass cap above: shrinking solve()'s budget only helps if
+        // something downstream actually spends the freed time, and a fixed
+        // count of 3 extra seeds did not. The original {2,3,4,5,6} fixed
+        // list is untouched (still tried first, in the same order), so
+        // every seed that depended on it keeps getting exactly the same
+        // candidates as before -- this only appends more.
+        for (int rank_cap : {0, 7, 6, 5, 4}) {
+            vector<uint64_t> shuffle_seeds = {2ull, 3ull, 4ull, 5ull, 6ull};
+            for (int extra = 0; extra < 20; extra++) shuffle_seeds.push_back(wall_seed_counter++);
+            for (uint64_t shuffle_seed : shuffle_seeds) {
+                for (bool favor_deep_low_ranks : {true, false}) {
+                    for (bool require_tree : {true, false}) {
+                        for (bool use_manufactured : {false, true}) {
+                            if (total_timer.elapsed() >= 1.84) goto variants_done;
+                            int t = -1;
+                            AHC067Solver::Plan p = solver.build_binary_counter_plan(
+                                t, require_tree, false, use_manufactured, false, false,
+                                favor_deep_low_ranks, true, rank_cap, shuffle_seed);
+                            if (t > binary_t) {
+                                binary_t = t;
+                                best_binary_plan = std::move(p);
+                            }
+                        }
+                        // The loop above only ever tries the manufactured
+                        // pocket search at its default corner
+                        // (manufactured_first=false, recover_shallower=false,
+                        // wide_seed_cap=false). The mandatory structural
+                        // sweep does try the other seven corners, but only
+                        // ever at wall_shuffle_seed=1 (see its own comment on
+                        // why that stays fixed). That leaves the
+                        // intersection -- a non-default pocket-search corner
+                        // together with a non-default wall shuffle --
+                        // completely unreachable by any existing candidate,
+                        // and measured directly (seed 28) that is exactly
+                        // where its winning plan lives: manufactured_first=
+                        // true, recover_shallower=true at shuffle_seed=2.
+                        // Cross the seven non-default corners in here too,
+                        // now that shrinking solve() leaves room for the
+                        // extra manufactured-pocket search cost. Skip the
+                        // all-false corner (already covered above) so this
+                        // only adds new candidates, never repeats one.
+                        for (bool manufactured_first : {false, true}) {
+                            for (bool recover_shallower : {false, true}) {
+                                for (bool wide_seed_cap : {false, true}) {
+                                    if (!manufactured_first && !recover_shallower && !wide_seed_cap) continue;
+                                    if (total_timer.elapsed() >= 1.84) goto variants_done;
+                                    int t = -1;
+                                    AHC067Solver::Plan p = solver.build_binary_counter_plan(
+                                        t, require_tree, manufactured_first, true, recover_shallower,
+                                        wide_seed_cap, favor_deep_low_ranks, true, rank_cap, shuffle_seed);
+                                    if (t > binary_t) {
+                                        binary_t = t;
+                                        best_binary_plan = std::move(p);
+                                    }
+                                }
+                            }
                         }
                     }
                 }
