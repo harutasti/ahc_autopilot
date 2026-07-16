@@ -126,6 +126,26 @@ int main() {
 ROOT = Path(__file__).resolve().parents[1]
 
 
+class SolverLayoutTest(unittest.TestCase):
+    def test_real_problems_own_their_solver(self) -> None:
+        from ahc_lab.config import load_problem_config
+
+        for name in ("ahc067", "ahc001"):
+            config = load_problem_config(ROOT, name)
+            self.assertEqual(config.solver_rel, f"problems/{name}/solver")
+            self.assertEqual(config.solver_dir(ROOT), ROOT / "problems" / name / "solver")
+            self.assertTrue((config.solver_dir(ROOT) / "main.cpp").exists())
+        # No shared repo-root solver slot remains.
+        self.assertFalse((ROOT / "solver").exists())
+
+    def test_solver_rel_defaults_to_root_solver(self) -> None:
+        from ahc_lab.config import load_problem_config
+
+        config = load_problem_config(ROOT, "dummy")
+        self.assertEqual(config.solver_rel, "solver")
+        self.assertEqual(config.solver_dir(ROOT), ROOT / "solver")
+
+
 class RunnerTest(unittest.TestCase):
     def test_timeout_kills_process_group(self) -> None:
         marker = f"ahc_orphan_{os.getpid()}"
@@ -150,7 +170,7 @@ class EvaluationTest(unittest.TestCase):
     def test_dummy_evaluation_and_analysis(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_s:
             tmp = Path(tmp_s)
-            shutil.copytree(ROOT / "solver", tmp / "solver")
+            (tmp / "solver").mkdir()
             shutil.copytree(ROOT / "problems", tmp / "problems")
             (tmp / "solver" / "main.cpp").write_text(
                 """
@@ -316,7 +336,7 @@ class SnapshotTest(unittest.TestCase):
             self.assertEqual(db.get_run(run_id_2)["source_hash"], source_hash)
             with tempfile.TemporaryDirectory() as other_s:
                 other = Path(other_s)
-                restore_solver_source(store_dir_for(db), source_hash, other)
+                restore_solver_source(store_dir_for(db), source_hash, other / "solver")
                 restored = (other / "solver" / "main.cpp").read_text(encoding="utf-8")
                 self.assertEqual(restored, ECHO_SOLVER)
 
@@ -326,9 +346,9 @@ class SnapshotTest(unittest.TestCase):
             (tmp / "solver").mkdir()
             store = tmp / "store"
             (tmp / "solver" / "main.cpp").write_text(ECHO_MINUS_TEN_SOLVER, encoding="utf-8")
-            base_hash = snapshot_solver_source(tmp, store)
+            base_hash = snapshot_solver_source(tmp / "solver", store)
             (tmp / "solver" / "main.cpp").write_text(ECHO_SOLVER, encoding="utf-8")
-            new_hash = snapshot_solver_source(tmp, store)
+            new_hash = snapshot_solver_source(tmp / "solver", store)
             diff = diff_snapshots(store, base_hash, new_hash)
             self.assertIn("-    std::cout << target - 10 << '\\n';", diff)
             self.assertIn("+    std::cout << target << '\\n';", diff)
@@ -339,10 +359,10 @@ class SnapshotTest(unittest.TestCase):
             (tmp / "solver").mkdir()
             (tmp / "solver" / "main.cpp").write_text(ECHO_SOLVER, encoding="utf-8")
             store = tmp / "store"
-            first = snapshot_solver_source(tmp, store)
-            self.assertEqual(snapshot_solver_source(tmp, store), first)
+            first = snapshot_solver_source(tmp / "solver", store)
+            self.assertEqual(snapshot_solver_source(tmp / "solver", store), first)
             (tmp / "solver" / "main.cpp").write_text(ECHO_MINUS_TEN_SOLVER, encoding="utf-8")
-            self.assertNotEqual(snapshot_solver_source(tmp, store), first)
+            self.assertNotEqual(snapshot_solver_source(tmp / "solver", store), first)
 
 
 class AutopilotMergeTest(unittest.TestCase):
@@ -1266,7 +1286,7 @@ else:
                 (seed_root / "solver" / "main.cpp").write_text(
                     ECHO_MINUS_FIVE_SOLVER, encoding="utf-8"
                 )
-                seeded_hash = snapshot_solver_source(seed_root, store)
+                seeded_hash = snapshot_solver_source(seed_root / "solver", store)
             seeded_run = db.create_run(
                 problem="dummy",
                 tag="autopilot_s1_seeded",

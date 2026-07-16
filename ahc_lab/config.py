@@ -86,11 +86,21 @@ class ProblemConfig:
     score_regex: str
     generator_timeout_sec: float
     score_timeout_sec: float
+    solver_rel: str
     raw: dict[str, Any]
 
     @property
     def maximize(self) -> bool:
         return self.score_direction.lower() != "min"
+
+    def solver_dir(self, root: Path) -> Path:
+        """Absolute solver-source directory for this problem under `root`.
+
+        Defaults to `root/solver`; real problems set `solver_dir:` to their own
+        `problems/<name>/solver` so each problem owns its source instead of
+        sharing one mainline slot.
+        """
+        return root / self.solver_rel
 
 
 def load_problem_config(root: Path, problem: str) -> ProblemConfig:
@@ -116,6 +126,7 @@ def load_problem_config(root: Path, problem: str) -> ProblemConfig:
         score_regex=str(data.get("score_regex", r"SCORE:\s*([-+0-9.eE]+)")),
         generator_timeout_sec=float(data.get("generator_timeout_sec", 30.0)),
         score_timeout_sec=float(data.get("score_timeout_sec", 60.0)),
+        solver_rel=str(data.get("solver_dir", "solver")),
         raw=data,
     )
 

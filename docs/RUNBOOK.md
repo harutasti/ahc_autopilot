@@ -51,7 +51,7 @@ ls experiments/adapter_logs/            # trial_N(.repair系)/orchestrator_* の
 
 ## セッション後にやること
 
-1. マージがあれば `solver/main.cpp` と `knowledge/<problem>_autopilot.md` の差分をコミット
+1. マージがあれば `problems/<problem>/solver/main.cpp`(問題ごとに solver を保持)と `knowledge/<problem>_autopilot.md` の差分をコミット
 2. マージゼロでも insights(knowledge 追記)はコミットして次セッションに還流させる
 3. 大きな学び(方向性の裁定など)は `knowledge/<problem>.md` に手動で追記する
    — オーケストレータは knowledge 検索経由でこれを読む
