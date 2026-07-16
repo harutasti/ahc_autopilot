@@ -79,6 +79,19 @@ python3 tools/ahc.py tune --problem ahc067 --seeds 0-59 --trials 50
 # 4) ベスト設定をエージェントに焼き込ませ、通常の採択ゲートを通す
 ```
 
+## 提出前チェック(必須)
+
+コンテストは「1ケースでも TLE なら提出全体が TLE」。提出前に必ず preflight を通す:
+
+```bash
+python3 tools/ahc.py preflight --problem ahc067 --seeds 0-99
+```
+
+全シードを直列(競合なし)・キャッシュなしで再計測し、全ケース ok かつ
+最遅ケースが `time_limit_sec × 0.95`(既定)以内でなければ exit 1。
+`over_margin` に出たシードは要調査。ジャッジ機が手元より遅い可能性を
+考慮し、マージンに余裕がないときは solver 内部の Timer 予算を下げる。
+
 ## ゲート調整(問題ごと)
 
 `problems/<problem>/config.yaml` の `acceptance:` ブロック。ahc067 は現在

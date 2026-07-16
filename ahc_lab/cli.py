@@ -15,6 +15,7 @@ from .knowledge import search_knowledge
 from .mcp_server import run_server_cli
 from .policy import AcceptancePolicy, evaluate_acceptance
 from .seeds import parse_seed_spec
+from .preflight import run_preflight
 from .snapshots import restore_solver_source, snapshot_solver_source, store_dir_for
 from .tuning import run_tuning
 
@@ -148,6 +149,17 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--jobs", type=int, default=None, help="parallel seed workers per evaluation")
     p.add_argument("--no-cache", action="store_true")
 
+    p = sub.add_parser("preflight")
+    p.add_argument("--problem", required=True)
+    p.add_argument("--seeds", default="0-99")
+    p.add_argument(
+        "--safety-ratio",
+        type=float,
+        default=0.95,
+        help="slowest case must stay under time_limit_sec * this ratio (default 0.95)",
+    )
+    p.add_argument("--use-cache", action="store_true", help="allow cached timings (default: fresh)")
+
     p = sub.add_parser("source")
     p.add_argument("--run", type=int, required=True)
     p.add_argument(
@@ -260,6 +272,17 @@ def main(argv: list[str] | None = None) -> int:
         )
         print(json.dumps(result, indent=2, sort_keys=True))
         return 0
+    if args.cmd == "preflight":
+        result = run_preflight(
+            root,
+            args.problem,
+            seeds=parse_seed_spec(args.seeds),
+            db=db,
+            safety_ratio=args.safety_ratio,
+            use_cache=args.use_cache,
+        )
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return 0 if result["passed"] else 1
     if args.cmd == "source":
         run = db.get_run(args.run)
         source_hash = run.get("source_hash")

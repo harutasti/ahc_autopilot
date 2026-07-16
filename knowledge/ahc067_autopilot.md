@@ -67,3 +67,45 @@ Auto-generated per generation.
 - repair attempts: 3 (rejected -> duplicate -> rejected)
 - pruned early: 3 worsening seed(s) exceed the budget of 1
 - agent summary tail: ously-tried source in `experiments/sources/` that this candidate is not a duplicate. **Risk:** Low — every phase result is still gated by exact BFS `evaluate()`/`best_t` tracking, so output is monotonically non-decreasing regardless of schedule; only the search trajectory changes. Timing margin is preserved (max observed 1.893s, well under the 2.0s hard limit, same 1.88 final cutoff as baseline).
+
+## 2026-07-13 04:39 g1 StateDesignBuilder -> accepted
+- mean effective delta 2714691.8666666667, confidence 1.0, wins/ties/losses 22/7/1
+- verdict: mean effective delta 2714691.8666666667 is positive with 22 win(s), 1 loss(es)
+
+## 2026-07-13 05:04 g2 StateDesignBuilder -> accepted
+- mean effective delta 995046.6333333333, confidence 1.0, wins/ties/losses 13/17/0
+- verdict: mean effective delta 995046.6333333333 is positive with 13 win(s), 0 loss(es)
+- repair attempts: 2 (rejected -> accepted)
+- agent summary tail: e exactly (T=13662 and T=14492, matching baseline precisely) - Seeds 1, 3, 4 (previous wins) are unchanged - New wins recovered on seeds 5, 6, 15, 21, 24 (each +2.6M to +4.8M) that were pruned/unseen in the failed gate run - Max elapsed time 1.889s, matching baseline, well under the 2.0s budget - Clean build with `-Wall -Wextra`, no warnings No regressions remain across any locally testable seed.
+
+## 2026-07-13 09:06 g1 StateDesignBuilder -> accepted
+- mean effective delta 856352.6, confidence 1.0, wins/ties/losses 26/4/0
+- verdict: mean effective delta 856352.6 is positive with 26 win(s), 0 loss(es)
+- repair attempts: 2 (rejected -> accepted)
+- agent summary tail: 4 ties, 0 losses**, worst-case delta 0 (well under the 150,000 budget and 1-seed limit). - Max elapsed time across all seeds: 1.900s, safely under the 2.0s gate limit (unchanged from before — the extra variants are cheap deterministic BFS/DFS, not RNG-timer-bound). The candidate is now a strict improvement over the accepted mainline with zero worsening seeds. File changed: `solver/main.cpp` only.
+
+## 2026-07-13 09:31 g2 StateDesignBuilder -> accepted
+- mean effective delta 391476.73333333334, confidence 1.0, wins/ties/losses 17/13/0
+- verdict: mean effective delta 391476.73333333334 is positive with 17 win(s), 0 loss(es)
+- agent summary tail: ovably optimal given its pocket pool); closing that gap further would need a different pocket-composition strategy (e.g., directional shell growth away from start rather than whole-graph-distance balls, or multiple independent chains) — noted in knowledge for the next iteration rather than attempted here, since further cut_cap/seed_cap sweeps showed no more low-risk gains available in this design.
+
+## 2026-07-14 00:38 g1 StateDesignBuilder -> accepted
+- mean effective delta 369678.0333333333, confidence 1.0, wins/ties/losses 26/4/0
+- verdict: mean effective delta 369678.0333333333 is positive with 26 win(s), 0 loss(es)
+- agent summary tail: I already have a background wait job (bkehp2esg) that will send a notification once the 100-seed comparison completes. I'll pause here until that notification arrives.
+
+## 2026-07-14 01:14 g2 StateDesignBuilder -> error
+- verdict: unrecoverable adapter failure (rate_limit): You've hit your session limit · resets 3am (UTC)
+- repair attempts: 3 (rejected -> rejected -> error)
+- agent summary tail: You've hit your session limit · resets 3am (UTC)
+
+## 2026-07-15 00:27 g1 StateDesignBuilder -> error
+- verdict: unrecoverable adapter failure (rate_limit): You've hit your session limit · resets 3:10am (UTC)
+- repair attempts: 3 (rejected -> rejected -> error)
+- agent summary tail: You've hit your session limit · resets 3:10am (UTC)
+
+## 2026-07-16 01:31 g1 StateDesignBuilder -> accepted
+- mean effective delta 213808.33333333334, confidence 1.0, wins/ties/losses 22/7/1
+- verdict: mean effective delta 213808.33333333334 is positive with 22 win(s), 1 loss(es)
+- repair attempts: 3 (rejected -> rejected -> accepted)
+- agent summary tail: seed is ≥ the previously-submitted candidate (zero new regressions) - Max elapsed time: ~1.928s (previously ~1.948s) — more safety margin under the 2.0s limit, not less - All 30 outputs pass the scorer's validity checks Net effect: worsening-seed count drops from 3 to 1 (at the allowed budget), with a large mean-score gain (~8.65M → ~8.87M across the local 30-seed set) and improved timing margin.
