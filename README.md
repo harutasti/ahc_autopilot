@@ -310,6 +310,12 @@ falls back to the static catalog and the error is recorded in
 `agent_messages`, so a broken orchestrator never stalls the loop. An explicit
 `--roles` list always takes precedence and skips the orchestrator entirely.
 
+The orchestrator prompt also includes the **role track record** — each role's
+accepted/attempts count and mean delta from the `agent_scorecards` table,
+accumulated across all past sessions — so role selection is weighted by what
+has actually worked on this problem, with an explicit nudge not to starve
+exploration of untested or newly invented roles.
+
 ```bash
 python3 tools/ahc.py autopilot --problem ahc067 --seeds 0-99 \
   --generations 8 --agents 3 --dynamic-roles --archive --repair-attempts 1
@@ -364,6 +370,23 @@ parameterizes the constants (reading `AHC_PARAM_*` with current defaults, a
 no-op change that passes the gate as score-neutral), `ahc tune` finds the
 best setting, and an agent bakes the winners in as a normal candidate that
 must pass the acceptance gate.
+
+## Session reports
+
+`ahc report` renders a markdown retrospective of an autopilot session straight
+from the experiments DB — no SQL required:
+
+```bash
+python3 tools/ahc.py report                 # latest session
+python3 tools/ahc.py report --session 8     # specific session
+python3 tools/ahc.py report --markdown out.md
+```
+
+The report contains a trial table (decision, mean delta, W/T/L, confidence,
+validation verdict, and the repair path such as `rejected → accepted`), the
+final gate reasons for every non-accepted trial, the run lineage tree
+(baseline → candidates → repairs → validations, with per-run mean scores),
+and the mainline trajectory across merged generations.
 
 ## Evaluation performance
 

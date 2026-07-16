@@ -439,6 +439,88 @@ target.write_text({ECHO_SOLVER!r}, encoding="utf-8")
             self.assertEqual(untouched, ECHO_MINUS_TEN_SOLVER)
 
 
+class ReportTest(unittest.TestCase):
+    def test_session_report_covers_trials_lineage_and_trajectory(self) -> None:
+        from ahc_lab.report import build_session_report
+
+        with tempfile.TemporaryDirectory() as tmp_s:
+            tmp = _make_dummy_root(Path(tmp_s), ECHO_MINUS_TEN_SOLVER)
+            adapter = tmp / "adapter.py"
+            adapter.write_text(
+                f"""import pathlib, sys
+p = pathlib.Path(sys.argv[1]) / "solver" / "main.cpp"
+p.write_text({ECHO_SOLVER!r}, encoding="utf-8")
+""",
+                encoding="utf-8",
+            )
+            db = ExperimentDB.default(tmp)
+            result = Autopilot(tmp, "dummy", db).run(
+                budget_sec=None,
+                max_trials=1,
+                agent_count=1,
+                seeds="0-2",
+                adapter_command=f"{sys.executable} {adapter} {{cwd}}",
+                roles=["AnnealingBuilder"],
+            )
+            text = build_session_report(db, result.session_id)
+            self.assertIn(f"# Session {result.session_id} — dummy (completed)", text)
+            self.assertIn("| AnnealingBuilder | accepted |", text)
+            self.assertIn("## Run lineage", text)
+            self.assertIn(f"run {result.baseline_run_id} [baseline/done]", text)
+            self.assertIn("## Mainline trajectory", text)
+            self.assertIn("merged run", text)
+            # CLI: default (latest session) prints the same report and exits 0.
+            self.assertEqual(cli_main(["--root", str(tmp), "report"]), 0)
+
+    def test_report_cli_without_sessions_fails_cleanly(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_s:
+            tmp = _make_dummy_root(Path(tmp_s), ECHO_SOLVER)
+            self.assertEqual(cli_main(["--root", str(tmp), "report"]), 1)
+
+
+class ScorecardPromptTest(unittest.TestCase):
+    def test_orchestrator_prompt_includes_track_record(self) -> None:
+        from ahc_lab.agents import build_orchestrator_prompt
+
+        with tempfile.TemporaryDirectory() as tmp_s:
+            tmp = _make_dummy_root(Path(tmp_s), ECHO_SOLVER)
+            db = ExperimentDB.default(tmp)
+            run_id = Evaluator(tmp, "dummy", db).evaluate([0], tag="base")
+            db.update_scorecard("AnnealingBuilder", True, 500_000.0)
+            db.update_scorecard("AnnealingBuilder", True, 300_000.0)
+            db.update_scorecard("CutBuilder", False, -10_000.0)
+            prompt = build_orchestrator_prompt(
+                root=tmp,
+                problem="dummy",
+                run_id=run_id,
+                analysis={},
+                knowledge_hits=[],
+                agent_count=2,
+                scorecards=db.get_scorecard(),
+            )
+            self.assertIn("Role track record", prompt)
+            self.assertIn("AnnealingBuilder: 2/2 accepted, mean delta +400,000", prompt)
+            self.assertIn("CutBuilder: 0/1 accepted, mean delta -10,000", prompt)
+
+    def test_orchestrator_prompt_without_history_says_so(self) -> None:
+        from ahc_lab.agents import build_orchestrator_prompt
+
+        with tempfile.TemporaryDirectory() as tmp_s:
+            tmp = _make_dummy_root(Path(tmp_s), ECHO_SOLVER)
+            db = ExperimentDB.default(tmp)
+            run_id = Evaluator(tmp, "dummy", db).evaluate([0], tag="base")
+            prompt = build_orchestrator_prompt(
+                root=tmp,
+                problem="dummy",
+                run_id=run_id,
+                analysis={},
+                knowledge_hits=[],
+                agent_count=2,
+                scorecards=db.get_scorecard(),
+            )
+            self.assertIn("(no track record yet)", prompt)
+
+
 class AutopilotGenerationTest(unittest.TestCase):
     def test_generation_loop_improves_until_stagnation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_s:

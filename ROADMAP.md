@@ -108,7 +108,11 @@
       `tuning_trials` に記録。評価は通常の evaluator 経由(キャッシュ・並列有効)。
 - [ ] ビジュアライザ画像のマルチモーダル入力(弱点シードの絵をプロンプトへ)→ [#9](https://github.com/harutasti/ahc_autopilot/issues/9)
 - [ ] モデルポートフォリオ / バンディットによる LLM・役割の選択学習 → [#10](https://github.com/harutasti/ahc_autopilot/issues/10)
+      🔶 第一歩実装済み: scorecard(役割ごとの採択実績・平均デルタ)をオーケストレータ
+      プロンプトに注入。役割選択が実績ベースに
 - [ ] ダッシュボード(世代・系統樹・スコア推移の可視化)→ [#11](https://github.com/harutasti/ahc_autopilot/issues/11)
+      🔶 第一歩実装済み: `ahc report` CLI(トライアル表・棄却理由・系統樹・スコア推移の
+      markdown レポート)
 - [ ] 問題セットアップの自動化(statement 取得 → config/tools 配置)→ [#12](https://github.com/harutasti/ahc_autopilot/issues/12)
 - [ ] ALE-Bench 的なメタ評価(過去AHC問題群でのシステム自体の性能測定)→ [#12](https://github.com/harutasti/ahc_autopilot/issues/12)
 - [ ] リモート評価(評価をローカルCPUから切り離す)→ [#12](https://github.com/harutasti/ahc_autopilot/issues/12)
