@@ -16,6 +16,7 @@ from .mcp_server import run_server_cli
 from .policy import AcceptancePolicy, evaluate_acceptance
 from .seeds import parse_seed_spec
 from .preflight import run_preflight
+from .report import build_session_report
 from .snapshots import restore_solver_source, snapshot_solver_source, store_dir_for
 from .tuning import run_tuning
 
@@ -135,6 +136,12 @@ def main(argv: list[str] | None = None) -> int:
             "--roles takes precedence"
         ),
     )
+
+    p = sub.add_parser("report")
+    p.add_argument(
+        "--session", type=int, default=None, help="autopilot session id (default: latest)"
+    )
+    p.add_argument("--markdown", type=Path, help="also write the report to this file")
 
     p = sub.add_parser("tune")
     p.add_argument("--problem", required=True)
@@ -258,6 +265,17 @@ def main(argv: list[str] | None = None) -> int:
             "merged_count": result.merged_count,
             "generations_run": result.generations_run,
         }, indent=2))
+        return 0
+    if args.cmd == "report":
+        session_id = args.session if args.session is not None else db.latest_session_id()
+        if session_id is None:
+            print("no autopilot sessions recorded yet")
+            return 1
+        text = build_session_report(db, session_id)
+        if args.markdown:
+            args.markdown.parent.mkdir(parents=True, exist_ok=True)
+            args.markdown.write_text(text, encoding="utf-8")
+        print(text)
         return 0
     if args.cmd == "tune":
         result = run_tuning(

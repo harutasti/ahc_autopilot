@@ -49,6 +49,16 @@ ls experiments/adapter_logs/            # trial_N(.repair系)/orchestrator_* の
 # agent_messages テーブル (agent_name='Orchestrator', role='roles')
 ```
 
+## セッションの振り返り
+
+```bash
+python3 tools/ahc.py report                # 最新セッションのレポート
+python3 tools/ahc.py report --session 8    # 過去セッション
+```
+
+トライアル表(判定・デルタ・修正経路・検証)、棄却理由、系統樹、
+マインラインのスコア推移が markdown で出る。sqlite を直接叩く必要はない。
+
 ## セッション後にやること
 
 1. マージがあれば `problems/<problem>/solver/main.cpp`(問題ごとに solver を保持)と `knowledge/<problem>_autopilot.md` の差分をコミット

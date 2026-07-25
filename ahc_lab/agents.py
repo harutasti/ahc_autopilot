@@ -289,12 +289,14 @@ def build_orchestrator_prompt(
     agent_count: int,
     focus: str | None = None,
     recent_changes: str = "",
+    scorecards: list[dict[str, Any]] | None = None,
 ) -> str:
     """Prompt asking the adapter LLM to design this generation's trial roles."""
     brief = make_ai_brief(ExperimentDB.default(root), run_id)
     problem_context = read_problem_context(root, problem)
     catalog = "\n".join(f"- {name}: {desc}" for name, desc in SPECIALISTS.items())
     focus_line = focus.strip() if focus and focus.strip() else "(none)"
+    track_record = _format_scorecards(scorecards or [])
     return f"""You are the Orchestrator of an autonomous AtCoder Heuristic Contest improvement lab.
 
 Task: design the specialist roles for the next generation of solver-improvement
@@ -341,9 +343,30 @@ Relevant knowledge:
 Recent accepted changes:
 {recent_changes or "(none yet)"}
 
+Role track record (accepted/attempts and mean delta across ALL past sessions;
+weight your choices toward what has worked, but do not starve exploration —
+a role with few attempts may simply be untested, and an invented role always
+starts without a record):
+{track_record}
+
 Example role catalog (for inspiration; reuse these or invent better ones):
 {catalog}
 """
+
+
+def _format_scorecards(scorecards: list[dict[str, Any]]) -> str:
+    if not scorecards:
+        return "(no track record yet)"
+    lines: list[str] = []
+    for card in scorecards:
+        attempts = int(card.get("attempts") or 0)
+        accepted = int(card.get("accepted") or 0)
+        mean_delta = (float(card.get("total_delta") or 0.0) / attempts) if attempts else 0.0
+        lines.append(
+            f"- {card['agent_name']}: {accepted}/{attempts} accepted, "
+            f"mean delta {mean_delta:+,.0f}"
+        )
+    return "\n".join(lines)
 
 
 def parse_roles_file(path: Path, limit: int) -> list[dict[str, str]]:
@@ -824,6 +847,7 @@ class Autopilot:
             agent_count=agent_count,
             focus=focus,
             recent_changes=recent_changes,
+            scorecards=self.db.get_scorecard(),
         )
         prompt_path = scratch / "orchestrator_prompt.md"
         prompt_path.write_text(prompt, encoding="utf-8")

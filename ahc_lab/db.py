@@ -504,6 +504,25 @@ class ExperimentDB:
         ).fetchall()
         return [dict(row) for row in rows]
 
+    def get_session(self, session_id: int) -> dict[str, Any]:
+        row = self.conn.execute(
+            "select * from autopilot_sessions where id = ?", (session_id,)
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"session not found: {session_id}")
+        return dict(row)
+
+    def latest_session_id(self) -> int | None:
+        row = self.conn.execute("select max(id) as m from autopilot_sessions").fetchone()
+        return int(row["m"]) if row and row["m"] is not None else None
+
+    def list_trials(self, session_id: int) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            "select * from autopilot_trials where session_id = ? order by id",
+            (session_id,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
     def get_trial(self, trial_id: int) -> dict[str, Any]:
         row = self.conn.execute(
             "select * from autopilot_trials where id = ?", (trial_id,)
